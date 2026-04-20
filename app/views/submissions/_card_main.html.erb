@@ -26,7 +26,7 @@
             </th>
             <td>
               <span class="submissionToken" data-id="<%= submission.id %>"
-                data-cy="submission-token">
+                data-testid="submission-token">
                 <%= submission.token %>
               </span>
               <i class="clipboardpopup far fa-copy clickable
@@ -101,7 +101,7 @@
             <%= t('basics.team') %>
             <%= helpdesk(t('submission.team_info'), false) %>
           </th>
-          <td data-cy="submission-team">
+          <td data-testid="submission-team">
             <% if submission.users.count == 1 %>
               <%= t('basics.you') %>
             <% else %>
@@ -177,7 +177,7 @@
                         role: :button,
                         data: { confirm: t('confirmation.generic'),
                                 color: 'btn-outline-danger',
-                                cy: "submission-leave" } %>
+                                testid: "submission-leave" } %>
           <% end %>
         <% else %>
           <%= link_to t('buttons.create'),
@@ -186,7 +186,7 @@
                       class: 'btn btn-outline-primary',
                       remote: true,
                       role: :button,
-                      data: { color: 'btn-outline-primary', cy: "create-submission" } %>
+                      data: { color: 'btn-outline-primary', testid: "create-submission" } %>
           <%= link_to t('buttons.join'),
                       enter_submission_code_path(submission,
                                                   params:
@@ -195,7 +195,7 @@
                       class: 'btn btn-outline-primary',
                       remote: true,
                       role: :button,
-                      data: { color: 'btn-outline-primary', cy: "submission-join" } %>
+                      data: { color: 'btn-outline-primary', testid: "submission-join" } %>
         <% end %>
         <% if assignment.in_grace_period? %>
           <%= tag.i class: 'fas fa-2x fa-info-circle helpdesk ms-2',
