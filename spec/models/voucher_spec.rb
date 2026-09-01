@@ -76,6 +76,30 @@ RSpec.describe(Voucher, type: :model) do
         end
       end
     end
+
+    describe "#ensure_role_valid_for_lecture" do
+      context "when the role is not offered for the lecture" do
+        # a seminar's groups are talks, so it offers no tutor role
+        let(:voucher) { build(:voucher, :tutor, lecture: seminar) }
+
+        it "rolls back and adds an error" do
+          expect(voucher.save).to be_falsey
+          expect(voucher.errors[:role]).to(
+            include(I18n.t("activerecord.errors.models.voucher.attributes." \
+                           "role.invalid_for_lecture"))
+          )
+        end
+      end
+
+      context "when the role is offered for the lecture" do
+        let(:voucher) { build(:voucher, :editor, lecture: lecture) }
+
+        it "does not add an error" do
+          expect(voucher.save).to be_truthy
+          expect(voucher.errors[:role]).to be_empty
+        end
+      end
+    end
   end
 
   describe "scopes" do
@@ -105,22 +129,8 @@ RSpec.describe(Voucher, type: :model) do
   describe "class methods" do
     describe ".roles_for_lecture" do
       context "when lecture is a seminar" do
-        after { Flipper.disable(:roster_maintenance) }
-
-        context "when roster_maintenance is enabled" do
-          before { Flipper.enable(:roster_maintenance) }
-
-          it "returns all roles except :tutor" do
-            expect(Voucher.roles_for_lecture(seminar)).to eq(Voucher::ROLE_HASH.keys - [:tutor])
-          end
-        end
-
-        context "when roster_maintenance is disabled" do
-          before { Flipper.disable(:roster_maintenance) }
-
-          it "returns all roles" do
-            expect(Voucher.roles_for_lecture(seminar)).to eq(Voucher::ROLE_HASH.keys)
-          end
+        it "returns all roles except :tutor" do
+          expect(Voucher.roles_for_lecture(seminar)).to eq(Voucher::ROLE_HASH.keys - [:tutor])
         end
       end
 
@@ -142,6 +152,22 @@ RSpec.describe(Voucher, type: :model) do
           voucher.invalidate!
           expect(voucher.invalidated_at).to eq(frozen_time)
         end
+      end
+    end
+
+    describe "#active?" do
+      it "is true for a fresh voucher" do
+        expect(FactoryBot.create(:voucher).active?).to be(true)
+      end
+
+      it "is false once invalidated" do
+        voucher = FactoryBot.create(:voucher)
+        voucher.invalidate!
+        expect(voucher.active?).to be(false)
+      end
+
+      it "is false once expired" do
+        expect(FactoryBot.create(:voucher, :expired).active?).to be(false)
       end
     end
   end

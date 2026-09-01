@@ -5,6 +5,7 @@ FactoryBot.define do
     association :term
 
     content_mode { "video" }
+    locale { "en" }
     sort { "lecture" }
 
     transient do
@@ -44,6 +45,10 @@ FactoryBot.define do
 
     trait :is_seminar do
       sort { "seminar" }
+    end
+
+    trait :with_vignettes do
+      vignettes { true }
     end
 
     trait :with_forum do

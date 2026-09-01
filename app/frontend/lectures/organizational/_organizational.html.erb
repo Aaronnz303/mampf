@@ -1,8 +1,4 @@
-<% if lecture.sort == "vignettes" %>
-  <div class="container-md small-width mt-4 mb-4">
-<% else %>
-  <div class="row mb-2">
-<% end %>
+<div class="row mb-2">
     <div class="col-12">
       <div class="card">
         <div class="card-header">
@@ -11,7 +7,7 @@
           </h4>
         </div>
         <div class="card-body" id="organizationalCardBody">
-          <%= lecture.organizational_concept&.html_safe %>
+          <%= sanitize(lecture.organizational_concept) %>
         </div>
       </div>
     </div>

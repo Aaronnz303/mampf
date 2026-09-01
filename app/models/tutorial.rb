@@ -1,5 +1,3 @@
-require "csv"
-
 class Tutorial < ApplicationRecord
   include Registration::Registerable
   include Rosters::Rosterable
@@ -17,10 +15,15 @@ class Tutorial < ApplicationRecord
 
   has_many :claims, as: :claimable, dependent: :destroy
 
-  before_destroy :check_destructibility, prepend: true
-
   validates :title, uniqueness: { scope: [:lecture_id] }, presence: true
   validate :lecture_must_not_be_seminar
+  validate :lecture_id_immutable, on: :update
+
+  scope :roster_eligible, lambda {
+    where(id: unscoped.joins(:tutorial_memberships).select(:id))
+      .or(where(id: unscoped.joins(:registration_items).select(:id)))
+      .or(where.not(self_materialization_mode: "disabled"))
+  }
 
   def title_with_tutors
     return "#{title}, #{I18n.t("basics.tba")}" unless tutors.any?
@@ -40,14 +43,18 @@ class Tutorial < ApplicationRecord
     tutors.map(&:tutorial_name).join(", ")
   end
 
-  def destructible?
-    super && Submission.where(tutorial: self).proper.none?
+  # Uploaded submissions are the one thing a tutorial carries that cannot be
+  # recreated; tutor assignments and voucher claims are links, not content.
+  def destruction_blockers
+    blockers = super
+    blockers << :submissions if submissions.with_uploads.exists?
+    blockers
   end
 
   def teams_to_csv(assignment)
     submissions = Submission.where(tutorial: self, assignment: assignment)
                             .proper.order(:last_modification_by_users_at)
-    CSV.generate(headers: false) do |csv|
+    SafeCsv.generate(headers: false) do |csv|
       submissions.each do |s|
         csv << [s.team]
       end
@@ -63,39 +70,46 @@ class Tutorial < ApplicationRecord
     tutorial_memberships
   end
 
-  def materialize_allocation!(user_ids:, campaign:)
-    transaction do
-      enforce_lecture_uniqueness!(user_ids)
-      super
-    end
+  def add_user_to_roster!(user, source_campaign = nil)
+    super
+  rescue ActiveRecord::RecordNotUnique
+    conflicting = TutorialMembership
+                  .find_by(lecture_id: lecture_id, user_id: user.id)
+    raise(Rosters::UserAlreadyInBundleError, conflicting&.tutorial || self)
+  end
+
+  def exclusive_assignment?
+    true
+  end
+
+  # A student can be in at most one tutorial per lecture (enforced by the
+  # unique index on tutorial_memberships (user_id, lecture_id)).
+  def roster_exclusive_within_lecture?
+    true
+  end
+
+  def conflicting_lecture_membership(user)
+    TutorialMembership.where(lecture: lecture, user: user)
+                      .where.not(tutorial: self)
+                      .first&.tutorial
   end
 
   private
 
-    def enforce_lecture_uniqueness!(user_ids)
-      # Enforce uniqueness: A student can only be in one tutorial per lecture.
-      # If we are about to add a student to this tutorial, remove them from any other
-      # tutorial in the same lecture.
-      TutorialMembership.joins(:tutorial)
-                        .where(tutorials: { lecture_id: lecture_id })
-                        .where.not(tutorial_id: id)
-                        .where(user_id: user_ids)
-                        .delete_all
+    def lecture_id_immutable
+      errors.add(:lecture_id, :immutable) if lecture_id_changed?
     end
 
-    def check_destructibility
-      return if destructible?
+    def extra_roster_entry_attributes(_user_id, _campaign)
+      { lecture_id: lecture_id }
+    end
 
-      if submissions.proper.exists?
-        errors.add(:base,
-                   I18n.t("controllers.tutorials.errors.cannot_delete_with_submissions"))
-      elsif in_campaign?
-        errors.add(:base, I18n.t("roster.errors.cannot_delete_in_campaign"))
-      elsif !roster_empty?
-        errors.add(:base, I18n.t("roster.errors.cannot_delete_not_empty"))
-      end
-
-      throw(:abort)
+    def persist_missing_roster_entries!(attributes)
+      roster_entries.upsert_all( # rubocop:disable Rails/SkipsModelValidations
+        attributes,
+        unique_by: :index_tutorial_memberships_on_user_id_and_lecture_id,
+        update_only: [:tutorial_id, :source_campaign_id]
+      )
     end
 
     def lecture_must_not_be_seminar

@@ -1,35 +1,47 @@
 module Rosters
-  class UserAlreadyInBundleError < StandardError
-    attr_reader :conflicting_group
-
-    def initialize(conflicting_group)
-      @conflicting_group = conflicting_group
-      super
-    end
-  end
-
   class MaintenanceService
     # Manages manual roster operations (add, remove, move) while enforcing capacity
     # constraints and ensuring transactional integrity
     class CapacityExceededError < StandardError; end
 
-    def add_user!(user, rosterable, force: false)
-      rosterable.with_lock do
-        add_user_without_lock!(user, rosterable, force: force)
+    # Raised to unwind the move. ActiveRecord::Rollback cannot do that job here:
+    # the nested with_lock transactions swallow it and commit anyway.
+    class MoveWithoutEffectError < StandardError; end
+
+    def add_user!(user, rosterable, force: false, source_campaign_id: nil)
+      added = rosterable.with_lock do
+        add_user_without_lock!(user,
+                               rosterable,
+                               force: force,
+                               source_campaign_id: source_campaign_id)
       end
+      RosterNotificationMailer.added(user, rosterable) if added
+      added
     end
 
     def remove_user!(user, rosterable)
-      rosterable.with_lock do
+      removed = rosterable.with_lock do
         remove_user_without_lock!(user, rosterable)
       end
+      RosterNotificationMailer.removed(user, rosterable) if removed
+      removed
     end
 
     def move_user!(user, from_rosterable, to_rosterable, force: false)
+      return false if from_rosterable == to_rosterable
+
       lock_rosterables_in_order(from_rosterable, to_rosterable) do
-        remove_user_without_lock!(user, from_rosterable)
-        add_user_without_lock!(user, to_rosterable, force: force)
+        raise(MoveWithoutEffectError) unless user_in_roster?(user, from_rosterable)
+
+        removed = remove_user_without_lock!(user, from_rosterable)
+        added   = add_user_without_lock!(user, to_rosterable, force: force)
+
+        raise(MoveWithoutEffectError) unless removed && added
       end
+      RosterNotificationMailer.moved(user, from_rosterable, to_rosterable)
+      true
+    rescue MoveWithoutEffectError
+      false
     end
 
     private
@@ -38,7 +50,7 @@ module Rosters
         rosterable.roster_entries.exists?(rosterable.roster_user_id_column => user.id)
       end
 
-      def add_user_without_lock!(user, rosterable, force: false)
+      def add_user_without_lock!(user, rosterable, force: false, source_campaign_id: nil)
         return if user_in_roster?(user, rosterable)
 
         ensure_uniqueness!(user, rosterable)
@@ -50,17 +62,20 @@ module Rosters
 
         membership = rosterable.add_user_to_roster!(user)
         propagate_to_lecture!(user, rosterable)
-        update_registration_materialization(user, rosterable)
+        update_registration_materialization(user,
+                                            rosterable,
+                                            source_campaign_id: source_campaign_id)
         membership
       end
 
       def remove_user_without_lock!(user, rosterable)
-        rosterable.remove_user_from_roster!(user)
+        removed = rosterable.remove_user_from_roster!(user)
         cascade_removal_from_subgroups!(user, rosterable)
+        removed
       end
 
       def lock_rosterables_in_order(*rosterables, &)
-        ActiveRecord::Base.transaction do
+        ActiveRecord::Base.transaction(requires_new: true) do
           sorted_rosterables = rosterables.uniq.sort_by { |r| [r.class.name, r.id.to_i] }
           lock_rosterables_recursively(sorted_rosterables, 0, &)
         end
@@ -69,11 +84,10 @@ module Rosters
       def lock_rosterables_recursively(sorted_rosterables, index, &)
         if index >= sorted_rosterables.length
           yield
-          return
-        end
-
-        sorted_rosterables[index].with_lock do
-          lock_rosterables_recursively(sorted_rosterables, index + 1, &)
+        else
+          sorted_rosterables[index].with_lock do
+            lock_rosterables_recursively(sorted_rosterables, index + 1, &)
+          end
         end
       end
 
@@ -84,24 +98,33 @@ module Rosters
         rosterable.roster_entries.count < rosterable.capacity
       end
 
-      def update_registration_materialization(user, rosterable)
+      def update_registration_materialization(user, rosterable, source_campaign_id: nil)
+        now = Time.current
+
         Registration::Item.where(registerable: rosterable).find_each do |item|
           # rubocop:disable Rails/SkipsModelValidations
           item.user_registrations.where(user: user)
-              .update_all(materialized_at: Time.current)
+              .update_all(materialized_at: now)
           # rubocop:enable Rails/SkipsModelValidations
         end
+
+        return if source_campaign_id.blank?
+
+        # rubocop:disable Rails/SkipsModelValidations
+        Registration::UserRegistration.rejected
+                                      .where(user: user,
+                                             registration_campaign_id: source_campaign_id,
+                                             rejection_overridden_at: nil)
+                                      .update_all(rejection_overridden_at: now,
+                                                  updated_at: now)
+        # rubocop:enable Rails/SkipsModelValidations
       end
 
       def ensure_uniqueness!(user, rosterable)
-        return unless rosterable.is_a?(Tutorial)
+        conflicting = rosterable.conflicting_lecture_membership(user)
+        return unless conflicting
 
-        siblings = rosterable.lecture.tutorials.where.not(id: rosterable.id)
-        membership = TutorialMembership.where(tutorial: siblings, user: user).first
-
-        return unless membership
-
-        raise(UserAlreadyInBundleError, membership.tutorial)
+        raise(UserAlreadyInBundleError, conflicting)
       end
 
       def propagate_to_lecture!(user, rosterable)

@@ -1,8 +1,59 @@
 require "rails_helper"
 
 RSpec.describe(User, type: :model) do
+  def fixture_file(name)
+    Rails.root.join(SPEC_FILES, name).open("rb")
+  end
+
   it "has a valid factory" do
     expect(FactoryBot.build(:user)).to be_valid
+  end
+
+  it "cannot be created without consent to the privacy policy" do
+    user = build(:user, consents: false)
+
+    expect(user).not_to be_valid
+    expect(user.errors[:consents]).to include(
+      I18n.t("activerecord.errors.models.user.attributes.consents.accepted")
+    )
+  end
+
+  it "stamps the consent date when consent is given" do
+    user = create(:user)
+
+    expect(user.consented_at).to be_present
+  end
+
+  it "uses the profile image uploader for user images" do
+    user = build(:user)
+    file = fixture_file("image.png")
+
+    user.image = file
+
+    expect(user.image_attacher).to be_a(ProfileimageUploader::Attacher)
+    expect(user).to be_valid
+    expect(user.image.metadata["mime_type"]).to eq("image/png")
+  ensure
+    file&.close
+  end
+
+  it "rejects forged clean-scan metadata on cached profile images" do
+    cached_upload = ProfileimageUploader.upload(
+      fixture_file("image.png"),
+      :cache
+    )
+    user = build(:user)
+    forged_data = cached_upload.data.deep_dup
+    forged_data["metadata"]["malware_scan"] = { "status" => "clean" }
+
+    user.image = forged_data.to_json
+
+    expect(user).not_to be_valid
+    expect(user.errors[:image]).to include(
+      I18n.t("submission.upload_failure_scan_required", locale: I18n.locale)
+    )
+  ensure
+    cached_upload&.delete
   end
 
   # test validations - SOME ARE MISSING
@@ -17,6 +68,79 @@ RSpec.describe(User, type: :model) do
     user = FactoryBot.build(:confirmed_user)
     user.homepage = "usual_bs"
     expect(user).not_to be_valid
+  end
+
+  it "lets a contributor delete their account", :password_strength do
+    teacher = create(:confirmed_user)
+    create(:lecture, teacher: teacher)
+
+    expect(teacher.archive_and_destroy("Archived Person")).to be_truthy
+    expect(User.exists?(teacher.id)).to be(false)
+    expect(User.where(archived: true).count).to eq(1)
+  end
+
+  it "is invalid with a password shorter than 15 characters", :password_strength do
+    user = FactoryBot.build(:user, password: "short-pass1")
+    expect(user).not_to be_valid
+    expect(user.errors[:password]).to be_present
+  end
+
+  it "is invalid with a weak password", :password_strength do
+    user = FactoryBot.build(:user,
+                            password: "password123456789",
+                            password_confirmation: "password123456789")
+    expect(user).not_to be_valid
+    expect(user.errors[:password]).to include(I18n.t("errors.messages.password_too_weak"))
+  end
+
+  it "is invalid with a password made of university words", :password_strength do
+    user = build(:user,
+                 password: "Sommersemester2026",
+                 password_confirmation: "Sommersemester2026")
+
+    expect(user).not_to be_valid
+    expect(user.errors[:password]).to include(I18n.t("errors.messages.password_too_weak"))
+  end
+
+  it "is invalid with a password using local identifiers", :password_strength do
+    user = FactoryBot.build(:user,
+                            password: "mampf-uni-heidelberg",
+                            password_confirmation: "mampf-uni-heidelberg")
+    expect(user).not_to be_valid
+    expect(user.errors[:password]).to include(I18n.t("errors.messages.password_too_weak"))
+  end
+
+  it "marks newly created users as compliant with the current password policy" do
+    user = FactoryBot.create(:confirmed_user)
+
+    expect(user.password_policy_version).to eq(User::CURRENT_PASSWORD_POLICY_VERSION)
+    expect(user.password_changed_at).to be_present
+  end
+
+  it "marks users as compliant and records when their password changes" do
+    user = FactoryBot.create(:confirmed_user)
+    # rubocop:disable Rails/SkipsModelValidations
+    user.update_columns(password_policy_version: 0, password_changed_at: nil)
+    # rubocop:enable Rails/SkipsModelValidations
+    before_update = Time.zone.now
+    user.update!(password: "updated-super-secure-passphrase",
+                 password_confirmation: "updated-super-secure-passphrase")
+    after_update = Time.zone.now
+
+    expect(user.reload.password_policy_version)
+      .to eq(User::CURRENT_PASSWORD_POLICY_VERSION)
+    expect(user.password_changed_at).to be_between(before_update, after_update)
+  end
+
+  it "does not change password policy metadata on unrelated updates" do
+    user = FactoryBot.create(:confirmed_user)
+    original_password_changed_at = user.password_changed_at
+
+    user.update!(name: "Updated Name")
+
+    expect(user.reload.password_policy_version)
+      .to eq(User::CURRENT_PASSWORD_POLICY_VERSION)
+    expect(user.password_changed_at).to eq(original_password_changed_at)
   end
 
   # test traits and subfactories
@@ -49,6 +173,26 @@ RSpec.describe(User, type: :model) do
     it "has correct number of lectures when called with lecture_count param" do
       user = FactoryBot.build(:user, :with_lectures, lecture_count: 3)
       expect(user.lectures.size).to eq(3)
+    end
+  end
+
+  describe "#rostered_tutorial_in" do
+    let(:lecture)   { create(:lecture) }
+    let(:tutorial)  { create(:tutorial, lecture: lecture) }
+    let(:user)      { create(:user) }
+
+    context "when user is rostered to a tutorial in the lecture" do
+      before { create(:tutorial_membership, user: user, tutorial: tutorial) }
+
+      it "returns the tutorial" do
+        expect(user.rostered_tutorial_in(lecture)).to eq(tutorial)
+      end
+    end
+
+    context "when user is not rostered to a tutorial in the lecture" do
+      it "returns nil" do
+        expect(user.rostered_tutorial_in(lecture)).to be_nil
+      end
     end
   end
 

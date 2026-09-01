@@ -9,7 +9,6 @@ RSpec.describe("Registration::Campaigns", type: :request) do
   let!(:campaign) { create(:registration_campaign, campaignable: lecture, status: :draft) }
 
   before do
-    Flipper.enable(:registration_campaigns)
     create(:editable_user_join, user: editor, editable: lecture)
   end
 
@@ -287,8 +286,47 @@ RSpec.describe("Registration::Campaigns", type: :request) do
         end
       end
 
-      context "when campaign is open" do
+      context "when campaign is open and nobody has registered" do
         let!(:campaign) { create(:registration_campaign, :open, campaignable: lecture) }
+
+        it "discards the campaign" do
+          expect do
+            delete(registration_campaign_path(campaign))
+          end.to change(Registration::Campaign, :count).by(-1)
+
+          expect(response).to redirect_to(lecture_registration_campaigns_path(lecture))
+          follow_redirect!
+          expect(response.body).to include(I18n.t("registration.campaign.discarded"))
+        end
+
+        it "keeps the campaign's groups and hands them back to manual management" do
+          tutorials = campaign.registration_items.map(&:registerable)
+
+          delete(registration_campaign_path(campaign))
+
+          expect(Tutorial.where(id: tutorials.map(&:id)).count).to eq(tutorials.size)
+          expect(tutorials.map { |t| t.reload.skip_campaigns }).to all(be(true))
+        end
+      end
+
+      context "when campaign is closed and nobody has registered" do
+        let!(:campaign) { create(:registration_campaign, :closed, campaignable: lecture) }
+
+        it "discards the campaign" do
+          expect do
+            delete(registration_campaign_path(campaign))
+          end.to change(Registration::Campaign, :count).by(-1)
+        end
+      end
+
+      context "when students have registered" do
+        let!(:campaign) { create(:registration_campaign, :open, campaignable: lecture) }
+
+        before do
+          create(:registration_user_registration,
+                 registration_campaign: campaign,
+                 registration_item: campaign.registration_items.first)
+        end
 
         it "does not destroy the campaign" do
           expect do
@@ -296,13 +334,52 @@ RSpec.describe("Registration::Campaigns", type: :request) do
           end.not_to change(Registration::Campaign, :count)
 
           expect(response).to redirect_to(registration_campaign_path(campaign))
-          expect(flash[:alert]).to be_present
+          follow_redirect!
+          expect(response.body)
+            .to include(I18n.t("activerecord.errors.models.registration/campaign" \
+                               ".attributes.base.cannot_discard_with_registrations"))
+        end
+      end
+
+      context "when an allocation reached a roster" do
+        let!(:campaign) { create(:registration_campaign, :closed, campaignable: lecture) }
+
+        before do
+          create(:tutorial_membership,
+                 tutorial: campaign.registration_items.first.registerable,
+                 source_campaign: campaign)
+        end
+
+        it "does not destroy the campaign" do
+          expect do
+            delete(registration_campaign_path(campaign))
+          end.not_to change(Registration::Campaign, :count)
+
+          follow_redirect!
+          expect(response.body)
+            .to include(I18n.t("activerecord.errors.models.registration/campaign" \
+                               ".attributes.base.cannot_discard_after_allocation"))
+        end
+      end
+
+      context "when the campaign is being processed" do
+        let!(:campaign) { create(:registration_campaign, :processing, campaignable: lecture) }
+
+        it "responds with error" do
+          delete registration_campaign_path(campaign), as: :turbo_stream
+          expect(response).to have_http_status(:ok)
+          assert_flash_error
+          expect(Registration::Campaign.exists?(campaign.id)).to be(true)
         end
       end
 
       context "when it cannot be deleted" do
+        let!(:campaign) { create(:registration_campaign, :open, campaignable: lecture) }
+
         before do
-          campaign.update!(status: :completed)
+          create(:registration_user_registration,
+                 registration_campaign: campaign,
+                 registration_item: campaign.registration_items.first)
         end
 
         it "responds with error" do
@@ -316,8 +393,6 @@ RSpec.describe("Registration::Campaigns", type: :request) do
         before do
           allow_any_instance_of(Registration::Campaign)
             .to receive(:destroy).and_return(false)
-          allow_any_instance_of(Registration::Campaign)
-            .to receive(:can_be_deleted?).and_return(true)
         end
 
         it "responds with error" do
@@ -416,6 +491,136 @@ RSpec.describe("Registration::Campaigns", type: :request) do
             expect(response.body).to include("Sticky Student")
           end
         end
+
+        context "when a student is still in the open rejected queue" do
+          let!(:campaign) do
+            create(:registration_campaign, :completed, campaignable: lecture)
+          end
+          let(:rejected_student) { create(:confirmed_user, name: "Rejected Student") }
+          let(:item) { campaign.registration_items.first }
+
+          before do
+            create(:registration_user_registration,
+                   :rejected,
+                   registration_campaign: campaign,
+                   registration_item: item,
+                   user: rejected_student,
+                   rejection_reason_label: "Needs prerequisite")
+          end
+
+          it "does not list rejected students in the unassigned panel" do
+            get unassigned_registration_campaign_path(campaign),
+                params: { source: "panel" }, as: :turbo_stream
+
+            expect(response).to have_http_status(:ok)
+            expect(response.body).not_to include("Rejected Student")
+          end
+        end
+
+        context "when a student was only left unassigned by the solver" do
+          let!(:campaign) do
+            create(:registration_campaign, :completed, campaignable: lecture)
+          end
+          let(:unassigned_student) { create(:confirmed_user, name: "Unassigned Student") }
+          let(:item) { campaign.registration_items.first }
+
+          before do
+            create(:registration_user_registration,
+                   :capacity_rejected,
+                   registration_campaign: campaign,
+                   registration_item: item,
+                   user: unassigned_student,
+                   rejection_reason_code: Registration::UserRegistration::REJECTION_REASON_CODE_SOLVER_UNASSIGNED,
+                   rejection_reason_label: I18n.t(
+                     "registration.user_registration.reason_labels.solver_unassigned"
+                   ))
+          end
+
+          it "still lists the student in the unassigned panel" do
+            get unassigned_registration_campaign_path(campaign),
+                params: { source: "panel" }, as: :turbo_stream
+
+            expect(response).to have_http_status(:ok)
+            expect(response.body).to include("Unassigned Student")
+          end
+        end
+      end
+    end
+  end
+
+  describe "GET /campaigns/:id/rejected" do
+    context "as an editor" do
+      before { sign_in editor }
+
+      context "without source=panel" do
+        it "redirects to the lecture groups tab" do
+          get rejected_registration_campaign_path(campaign)
+          expect(response).to redirect_to(edit_lecture_path(campaign.campaignable, tab: "groups"))
+        end
+      end
+
+      context "with source=panel" do
+        let!(:rejected_campaign) do
+          create(:registration_campaign, :completed, campaignable: lecture)
+        end
+        let(:item) { rejected_campaign.registration_items.first }
+        let(:rejected_student) { create(:confirmed_user, name: "Rejected Student") }
+
+        before do
+          create(:registration_user_registration,
+                 :rejected,
+                 registration_campaign: rejected_campaign,
+                 registration_item: item,
+                 user: rejected_student,
+                 rejection_reason_label: "Needs prerequisite")
+        end
+
+        it "renders the rejected roster side panel turbo stream" do
+          get rejected_registration_campaign_path(rejected_campaign),
+              params: { source: "panel" }, as: :turbo_stream
+
+          expect(response).to have_http_status(:ok)
+          assert_turbo_stream action: :replace, target: "tutorial-roster-side-panel"
+          expect(response.body).to include("Rejected Student")
+          expect(response.body).to include("Needs prerequisite")
+        end
+
+        it "hides overridden rejected students" do
+          rejected_campaign.user_registrations.find_by(user: rejected_student)
+                           .update!(rejection_overridden_at: Time.current)
+
+          get rejected_registration_campaign_path(rejected_campaign),
+              params: { source: "panel" }, as: :turbo_stream
+
+          expect(response).to have_http_status(:ok)
+          expect(response.body).not_to include("Rejected Student")
+        end
+
+        it "does not list solver-unassigned students" do
+          rejected_campaign.user_registrations.find_by(user: rejected_student)
+                           .update!(
+                             rejection_reason_code: Registration::UserRegistration::REJECTION_REASON_CODE_SOLVER_UNASSIGNED,
+                             rejection_reason_label: I18n.t(
+                               "registration.user_registration.reason_labels.solver_unassigned"
+                             )
+                           )
+
+          get rejected_registration_campaign_path(rejected_campaign),
+              params: { source: "panel" }, as: :turbo_stream
+
+          expect(response).to have_http_status(:ok)
+          expect(response.body).not_to include("Rejected Student")
+        end
+      end
+    end
+
+    context "as a student" do
+      before { sign_in student }
+
+      it "redirects to root (unauthorized)" do
+        get rejected_registration_campaign_path(campaign)
+
+        expect(response).to redirect_to(root_path)
       end
     end
   end
@@ -436,6 +641,79 @@ RSpec.describe("Registration::Campaigns", type: :request) do
       it "redirects to root (unauthorized)" do
         get edit_registration_campaign_path(campaign)
         expect(response).to redirect_to(root_path)
+      end
+    end
+  end
+
+  describe "DELETE /campaigns/:id when the campaign is gone by the time it is locked" do
+    # set_campaign finds without a lock, so the row can disappear before
+    # with_lock reloads it. Only a stub opens that window in one process.
+    it "says so instead of raising" do
+      campaign = create(:registration_campaign, campaignable: lecture)
+      sign_in editor
+      allow_any_instance_of(Registration::Campaign)
+        .to receive(:with_lock).and_raise(ActiveRecord::RecordNotFound)
+
+      delete(registration_campaign_path(campaign))
+
+      expect(Registration::Campaign.exists?(campaign.id)).to be(true)
+      expect(flash[:alert]).to eq(I18n.t("registration.campaign.not_found"))
+    end
+  end
+
+  describe "PATCH /campaigns/:id/revert_to_draft" do
+    let!(:campaign) do
+      create(:registration_campaign, :open, campaignable: lecture)
+    end
+
+    context "as an editor" do
+      before { sign_in editor }
+
+      it "takes an opened campaign back to draft" do
+        patch revert_to_draft_registration_campaign_path(campaign)
+
+        expect(campaign.reload).to be_draft
+        expect(flash[:notice]).to be_present
+      end
+
+      it "takes a closed campaign back to draft" do
+        campaign.update!(status: :closed)
+
+        patch revert_to_draft_registration_campaign_path(campaign)
+
+        expect(campaign.reload).to be_draft
+      end
+
+      it "refuses once a student has registered" do
+        create(:registration_user_registration,
+               registration_campaign: campaign,
+               registration_item: campaign.registration_items.first)
+
+        patch revert_to_draft_registration_campaign_path(campaign)
+
+        expect(campaign.reload).to be_open
+        expect(flash[:alert]).to be_present
+      end
+
+      it "refuses while the allocation is being processed" do
+        campaign.update!(status: :processing,
+                         last_allocation_calculated_at: 1.hour.ago)
+
+        patch revert_to_draft_registration_campaign_path(campaign)
+
+        expect(campaign.reload).to be_processing
+        expect(flash[:alert]).to be_present
+      end
+    end
+
+    context "as a student" do
+      before { sign_in student }
+
+      it "is not allowed" do
+        patch revert_to_draft_registration_campaign_path(campaign)
+
+        expect(campaign.reload).to be_open
+        expect(response).to have_http_status(:redirect)
       end
     end
   end
@@ -520,6 +798,78 @@ RSpec.describe("Registration::Campaigns", type: :request) do
 
       it "redirects to root (unauthorized)" do
         patch reopen_registration_campaign_path(campaign)
+        expect(response).to redirect_to(root_path)
+      end
+    end
+  end
+
+  describe "PATCH /campaigns/:id/self_service" do
+    let!(:campaign) do
+      create(:registration_campaign, :completed, :first_come_first_served,
+             campaignable: lecture, items_count: 2)
+    end
+
+    context "as an editor" do
+      before { sign_in editor }
+
+      it "opens self-service on all of the campaign's groups" do
+        patch self_service_registration_campaign_path(campaign),
+              params: { self_materialization_mode: "add_and_remove" }
+
+        modes = campaign.registerables.map(&:self_materialization_mode).uniq
+        expect(modes).to eq(["add_and_remove"])
+        expect(response).to redirect_to(registration_campaign_path(campaign))
+      end
+
+      it "responds with a turbo stream (the modal submission path)" do
+        patch self_service_registration_campaign_path(campaign),
+              params: { self_materialization_mode: "add_and_remove" },
+              as: :turbo_stream
+
+        expect(response).to have_http_status(:ok)
+        expect(response.media_type).to eq(Mime[:turbo_stream])
+        expect(campaign.registerables.map(&:self_materialization_mode).uniq)
+          .to eq(["add_and_remove"])
+      end
+
+      it "rejects an unknown mode with a flash error" do
+        patch self_service_registration_campaign_path(campaign),
+              params: { self_materialization_mode: "nonsense" }, as: :turbo_stream
+
+        assert_flash_error
+        expect(campaign.registerables.map(&:self_materialization_mode).uniq)
+          .to eq(["disabled"])
+      end
+
+      it "rejects a missing mode with a flash error" do
+        patch self_service_registration_campaign_path(campaign),
+              as: :turbo_stream
+
+        assert_flash_error
+        expect(campaign.registerables.map(&:self_materialization_mode).uniq)
+          .to eq(["disabled"])
+      end
+
+      it "refuses while the campaign is not completed" do
+        draft = create(:registration_campaign, :first_come_first_served,
+                       :with_items, campaignable: lecture, items_count: 2)
+
+        patch self_service_registration_campaign_path(draft),
+              params: { self_materialization_mode: "add_and_remove" },
+              as: :turbo_stream
+
+        assert_flash_error
+        expect(draft.registerables.map(&:self_materialization_mode).uniq)
+          .to eq(["disabled"])
+      end
+    end
+
+    context "as a student" do
+      before { sign_in student }
+
+      it "redirects to root (unauthorized)" do
+        patch self_service_registration_campaign_path(campaign),
+              params: { self_materialization_mode: "add_and_remove" }
         expect(response).to redirect_to(root_path)
       end
     end

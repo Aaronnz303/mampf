@@ -7,6 +7,15 @@ class ApplicationController < ActionController::Base
   include Pagy::Method
   include Flash
 
+  # Content types allowed to render inline in the browser. Anything else served
+  # inline is downgraded so a stored user blob whose real content is HTML/SVG/etc.
+  # cannot execute as our own origin (a content-sniffed text/html submission served
+  # inline would run as the viewing tutor).
+  INLINE_SAFE_MIME_TYPES = [
+    "application/pdf", "image/png", "image/jpeg", "image/gif",
+    "video/mp4", "application/zip"
+  ].freeze
+
   before_action :store_user_location!, if: :storable_location?
   # The callback which stores the current location must be added before you
   # authenticate the user as `authenticate_user!` (or whatever your resource is)
@@ -14,6 +23,7 @@ class ApplicationController < ActionController::Base
   before_action :configure_permitted_parameters, if: :devise_controller?
   before_action :authenticate_user!
   before_action :set_current_user
+  before_action :enforce_password_change
 
   include LocaleSetter
 
@@ -49,6 +59,11 @@ class ApplicationController < ActionController::Base
     redirect_to main_app.root_url, alert: exception.message
   end
 
+  rescue_from MalwareScanGate::UntrustedUploadError do
+    redirect_back_or_to main_app.root_url,
+                        alert: I18n.t("submission.upload_failure_unauthorized")
+  end
+
   rescue_from ActionController::InvalidAuthenticityToken do
     redirect_to main_app.root_url,
                 alert: I18n.t("controllers.session_expired")
@@ -58,12 +73,36 @@ class ApplicationController < ActionController::Base
   def after_sign_in_path_for(resource_or_scope)
     # see https://github.com/heartcombo/devise/wiki/How-To:-Redirect-back-to-current-page-after-sign-in,-sign-out,-sign-up,-update
     # see https://www.rubydoc.info/github/plataformatec/devise/Devise%2FControllers%2FHelpers:after_sign_in_path_for
-    stored = stored_location_for(resource_or_scope)
-    if stored.present? && stored != super
-      stored
-    else
-      start_path
+    if password_change_required_for?(resource_or_scope)
+      session[:enforce_password_change] = true
+      return edit_user_registration_path
     end
+
+    stored = stored_location_for(resource_or_scope)
+    return stored if stored.present? && stored != super
+    return edit_profile_path if first_sign_in?(resource_or_scope)
+
+    start_path
+  end
+
+  # Whether the user is arriving from their very first sign-in, which is the
+  # moment we ask them to fill in their profile. Trackable has already counted
+  # the sign-in in progress by the time this runs.
+  def first_sign_in?(resource)
+    resource.is_a?(User) && resource.sign_in_count == 1
+  end
+
+  # The submitted address as Devise will look it up, so that padded or
+  # differently cased spellings of one address share a rate-limit bucket
+  # (`strip_whitespace_keys` and `case_insensitive_keys`).
+  def throttle_email
+    params.dig(:user, :email).to_s.strip.downcase
+  end
+
+  # Tells a visitor whose request the rate limiter refused how long to wait.
+  def throttled_message(window)
+    I18n.t("devise.failure.too_many_requests",
+           wait: helpers.distance_of_time_in_words(window))
   end
 
   def prevent_caching
@@ -81,6 +120,19 @@ class ApplicationController < ActionController::Base
 
     turbo_stream.update("campaigns_container",
                         partial: "registration/campaigns/card_body_index",
+                        locals: {
+                          lecture: lecture,
+                          registration_section: params[:registration_section]
+                        })
+  end
+
+  # A seminar lists its talks twice on the edit page: as group tiles and in the
+  # content card above them. Adding or deleting one has to reach both.
+  def refresh_seminar_content_stream(lecture)
+    return nil unless lecture&.seminar?
+
+    turbo_stream.update("lecture-content-card",
+                        partial: "lectures/edit/seminar_content",
                         locals: { lecture: lecture })
   end
 
@@ -92,6 +144,39 @@ class ApplicationController < ActionController::Base
     end
 
   private
+
+    def download_path(file)
+      return file.storage.path(file.id) if file.storage.respond_to?(:path)
+
+      file.to_io.path
+    end
+
+    def send_stored_file(file, disposition:, fallback:)
+      mime_type = file.metadata["mime_type"].to_s.presence
+
+      if disposition == "inline" && mime_type &&
+         INLINE_SAFE_MIME_TYPES.exclude?(mime_type)
+        if mime_type.start_with?("text/")
+          mime_type = "text/plain; charset=utf-8"
+        else
+          disposition = "attachment"
+        end
+      end
+
+      options = { disposition: disposition, filename: stored_filename(file, fallback) }
+      options[:type] = mime_type if mime_type
+
+      # Serving hygiene: never let the browser content-type-sniff a stored
+      # upload (e.g. an mp4) into an executable/HTML interpretation.
+      response.headers["X-Content-Type-Options"] = "nosniff"
+      send_file(download_path(file), **options)
+    end
+
+    def stored_filename(file, fallback)
+      filename = File.basename(file.metadata["filename"].to_s.tr("\\", "/"))
+
+      ActiveStorage::Filename.wrap(filename.presence || fallback).sanitized
+    end
 
     # It's important that the location is NOT stored if:
     # - The request method is not GET (non idempotent)
@@ -110,9 +195,59 @@ class ApplicationController < ActionController::Base
       store_location_for(:user, request.fullpath)
     end
 
+    def enforce_password_change
+      return unless user_signed_in?
+      return unless current_user.password_change_required?
+      return if password_change_request_allowed?
+
+      session[:enforce_password_change] = true
+      return redirect_to(edit_user_registration_path) unless turbo_frame_request?
+
+      # Turbo looks for its frame in the answer and the password page has none,
+      # so a redirect would only leave "Content missing" behind. This sends
+      # Turbo out of the frame; the reload then meets the redirect above.
+      render html: helpers.tag.meta(name: "turbo-visit-control", content: "reload"),
+             layout: false
+    end
+
+    def password_change_request_allowed?
+      return true if controller_name == "registrations" &&
+                     action_name.in?(["edit", "update"])
+      return true if controller_name == "passwords"
+
+      controller_name == "sessions" && action_name == "destroy"
+    end
+
+    def password_change_required_for?(resource_or_scope)
+      resource = current_resource_from_scope(resource_or_scope)
+      resource&.password_change_required?
+    end
+
+    def current_resource_from_scope(resource_or_scope)
+      return resource_or_scope if resource_or_scope.respond_to?(:password_change_required?)
+      return unless resource_or_scope.is_a?(Symbol)
+
+      public_send("current_#{resource_or_scope}")
+    end
+
+    # after_sign_in_path_for skips these rules while the change is still due,
+    # so they are applied once it is done.
+    def after_password_change_path_for(resource)
+      session.delete(:enforce_password_change)
+      stored_location_for(resource).presence ||
+        (first_sign_in?(resource) ? edit_profile_path : start_path)
+    end
+
     # https://stackoverflow.com/a/69313330/
     def set_current_user
       Current.user = current_user
+    end
+
+    def enqueue_consumption(medium_id, mode, sort)
+      ConsumptionSaver.perform_async(medium_id, mode, sort)
+    rescue StandardError => e
+      Rails.logger.error("Failed to enqueue consumption " \
+                         "medium_id=#{medium_id} mode=#{mode} sort=#{sort}: #{e.message}")
     end
 
     # Ensures that the current request is a Turbo Frame request.

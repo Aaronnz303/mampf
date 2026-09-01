@@ -3,14 +3,15 @@ class LecturesController < ApplicationController
   include ActionController::RequestForgeryProtection
 
   before_action :set_lecture, except: [:new, :create, :search]
-  before_action :set_lecture_cookie, only: [:show, :organizational,
+  before_action :set_lecture_cookie, only: [:show, :outline, :organizational,
                                             :show_announcements]
-  authorize_resource except: [:new, :create, :search]
+  authorize_resource except: [:new, :create, :search, :outline]
   before_action :check_for_consent
-  before_action :check_for_subscribe, only: [:show]
-  before_action :set_view_locale, only: [:edit, :show, :subscribe_page,
+  before_action :check_for_subscribe, only: [:outline]
+  before_action :set_view_locale, only: [:edit, :show, :outline, :subscribe_page,
                                          :show_random_quizzes]
   before_action :check_if_enough_questions, only: [:show_random_quizzes]
+  before_action :require_turbo_frame, only: [:new]
   layout "administration"
 
   def current_ability
@@ -18,40 +19,16 @@ class LecturesController < ApplicationController
   end
 
   def show
-    if @lecture.sort == "vignettes"
-      if @lecture.organizational
-        redirect_to lecture_organizational_path(@lecture)
-        return
-      end
-      redirect_to lecture_questionnaires_path(@lecture)
-      return
+    if lecture_home_landing_page?
+      redirect_to lecture_home_path(@lecture)
+    else
+      redirect_to lecture_outline_path(@lecture)
     end
+  end
 
-    # deactivate http caching for the moment
-    if stale?(etag: @lecture,
-              last_modified: [current_user.updated_at,
-                              @lecture.updated_at,
-                              Time.zone.parse(ENV.fetch("RAILS_CACHE_ID", nil)),
-                              Thredded::UserDetail.find_by(user_id: current_user.id)
-                                                  &.last_seen_at || @lecture.updated_at,
-                              @lecture.forum&.updated_at || @lecture.updated_at].max)
-      @lecture = Lecture.includes(:teacher, :term, :editors, :users,
-                                  :announcements, :imported_media,
-                                  course: [:editors],
-                                  media: [:teachable, :tags],
-                                  lessons: [media: [:tags]],
-                                  chapters: [:lecture,
-                                             { sections: [lessons: [:tags],
-                                                          chapter: [:lecture],
-                                                          tags: [:notions,
-                                                                 :lessons]] }])
-                        .find_by(id: params[:id])
-      @notifications = current_user.active_notifications(@lecture)
-      @new_topics_count = @lecture.unread_forum_topics_count(current_user) || 0
-
-      render template: "lectures/show/show",
-             layout: turbo_frame_request? ? "turbo_frame" : "application"
-    end
+  def outline
+    authorize! :show, @lecture
+    render_outline
   end
 
   def new
@@ -67,9 +44,9 @@ class LecturesController < ApplicationController
       @lecture.annotations_status = 0
     end
 
-    respond_to do |format|
-      format.js { render template: "lectures/new/new" }
-    end
+    render turbo_stream: turbo_stream.update(turbo_frame_request_id,
+                                             partial: "lectures/new/new",
+                                             locals: { lecture: @lecture, from: @from })
   end
 
   def edit
@@ -86,31 +63,42 @@ class LecturesController < ApplicationController
     @lecture = Lecture.new(lecture_params)
     @lecture.teacher = current_user unless current_user.admin?
     authorize! :create, @lecture
-    @lecture.save
 
-    if @lecture.valid?
+    if @lecture.save
       @lecture.update(sort: "special") if @lecture.course.term_independent
       # set organizational_concept to default
       set_organizational_defaults
       # set language to default language
       set_language
-      # depending on where the create action was triggered from, return
-      # to admin index view or edit course view
-      unless params[:lecture][:from] == "course"
-        redirect_to administration_path,
-                    notice: I18n.t("controllers.created_lecture_success",
-                                   lecture: @lecture.title_with_teacher)
-        return
-      end
-      redirect_to edit_course_path(@lecture.course),
-                  notice: I18n.t("controllers.created_lecture_success",
-                                 lecture: @lecture.title_with_teacher)
-      return
-    end
 
-    @errors = @lecture.errors
-    respond_to do |format|
-      format.js { render template: "lectures/create/create" }
+      flash.now[:notice] = I18n.t("controllers.created_lecture_success",
+                                  lecture: @lecture.title_with_teacher)
+
+      streams = []
+
+      if params.dig(:lecture, :from) == "course"
+        streams << turbo_stream.update("course_lectures",
+                                       partial: "courses/lectures_list",
+                                       locals: { course: @lecture.course })
+        streams << turbo_stream.update(Lecture.new,
+                                       partial: "spinner/loading")
+      else
+        streams << turbo_stream.update("lectures",
+                                       partial: "administration/index/lectures_list")
+        streams << turbo_stream.update(Lecture.new, "")
+      end
+
+      streams << turbo_stream.prepend("flash-messages",
+                                      partial: "flash/message")
+
+      render turbo_stream: streams
+    else
+      @from = params.dig(:lecture, :from)
+
+      render turbo_stream: turbo_stream.update(turbo_frame_request_id,
+                                               partial: "lectures/new/new",
+                                               locals: { lecture: @lecture, from: @from }),
+             status: :unprocessable_content
     end
   end
 
@@ -148,9 +136,17 @@ class LecturesController < ApplicationController
       return
     end
 
-    respond_to do |format|
-      format.js { render template: "lectures/update/update" }
+    @terms = Term.select_terms
+
+    pane, partial = if params[:subpage] == "people"
+      ["edit_people", "lectures/edit/people"]
+    else
+      ["edit_preferences", "lectures/edit/preferences"]
     end
+
+    render turbo_stream: turbo_stream.update(pane, partial: partial,
+                                                   locals: { lecture: @lecture }),
+           status: :unprocessable_content
   end
 
   def publish
@@ -166,10 +162,16 @@ class LecturesController < ApplicationController
   end
 
   def destroy
-    @lecture.destroy
+    unless @lecture.destroy
+      redirect_to edit_lecture_path(@lecture, tab: "groups"),
+                  alert: lecture_destruction_error,
+                  status: :see_other
+      return
+    end
+
     # destroy all notifications related to this lecture
     destroy_notifications
-    redirect_to administration_path
+    redirect_to administration_path, status: :see_other
   end
 
   # add forum for this lecture
@@ -214,16 +216,10 @@ class LecturesController < ApplicationController
   end
 
   def organizational
-    if @lecture.sort == "vignettes"
-      render template: "lectures/organizational/_organizational",
-             layout: "vignettes/layouts/vignettes_navbar",
-             locals: { lecture: @lecture }
-    else
-      I18n.locale = @lecture.locale_with_inheritance
-      render template: "lectures/organizational/_organizational",
-             locals: { lecture: @lecture },
-             layout: turbo_frame_request? ? "turbo_frame" : "application"
-    end
+    I18n.locale = @lecture.locale_with_inheritance
+    render template: "lectures/organizational/_organizational",
+           locals: { lecture: @lecture },
+           layout: turbo_frame_request? ? "turbo_frame" : "application"
   end
 
   def import_media
@@ -234,9 +230,15 @@ class LecturesController < ApplicationController
     @lecture.reload
     @lecture.touch
 
-    respond_to do |format|
-      format.js { render template: "lectures/import/import_media" }
-    end
+    render turbo_stream: [
+      turbo_stream.update("importedMediaTable",
+                          partial: "lectures/import/imported_media",
+                          locals: { media: @lecture.imported_media,
+                                    lecture: @lecture }),
+      turbo_stream.replace("importMedia",
+                           helpers.import_media_badge(@lecture)),
+      turbo_stream.update("media-search-results", "")
+    ]
   end
 
   def remove_imported_medium
@@ -246,9 +248,14 @@ class LecturesController < ApplicationController
     @lecture.reload
     @lecture.touch
 
-    respond_to do |format|
-      format.js { render template: "lectures/import/remove_imported_medium" }
-    end
+    render turbo_stream: [
+      turbo_stream.update("importedMediaTable",
+                          partial: "lectures/import/imported_media",
+                          locals: { media: @lecture.imported_media,
+                                    lecture: @lecture }),
+      turbo_stream.replace("importMedia",
+                           helpers.import_media_badge(@lecture))
+    ]
   end
 
   def show_subscribers
@@ -283,6 +290,29 @@ class LecturesController < ApplicationController
       configurator_class: Search::Configurators::LectureSearchConfigurator,
       options: { infinite_scroll: params[:infinite_scroll], default_per_page: 6 }
     )
+    if @lectures.respond_to?(:includes)
+      # avoid N+1 queries for the registration badge on the result cards
+      @lectures = @lectures.includes(:registration_campaigns)
+    end
+    # ID sets for the state indicators on the result cards (computed once
+    # per request and scoped to the current page, so the cards do not
+    # trigger per-lecture queries and the cost is bounded by the page size)
+    page_lecture_ids = @lectures.map(&:id)
+    @subscribed_lecture_ids =
+      current_user.lecture_user_joins
+                  .where(lecture_id: page_lecture_ids)
+                  .pluck(:lecture_id).to_set
+    @registered_lecture_ids =
+      Registration::UserRegistration
+      .where(user: current_user, status: [:pending, :confirmed])
+      .joins(:registration_campaign)
+      .where(registration_campaigns: { campaignable_type: "Lecture",
+                                       campaignable_id: page_lecture_ids })
+      .pluck("registration_campaigns.campaignable_id")
+      .to_set
+    status = Rosters::SelfEnrollmentStatusQuery.new(current_user, page_lecture_ids)
+    @rosterized_lecture_ids = status.rosterized_lecture_ids
+    @self_enrollable_lecture_ids = status.enrollable_lecture_ids
 
     respond_to do |format|
       format.js { render template: "lectures/search/old/search" }
@@ -359,19 +389,59 @@ class LecturesController < ApplicationController
     end
 
     def check_for_subscribe
+      # Staff bypass the subscription gate for content.
+      return if current_user.can_edit?(@lecture)
+
       return if @lecture.in?(current_user.lectures)
 
-      redirect_to subscribe_lecture_page_path(@lecture.id)
+      # Non-subscribers are sent to the lecture's home page (its
+      # organizational front door), which offers registration (if the
+      # lecture uses it) as well as a link to the subscription page.
+      redirect_to lecture_home_path(@lecture)
+    end
+
+    def render_outline
+      # deactivate http caching for the moment
+      if stale?(etag: @lecture,
+                last_modified: [current_user.updated_at,
+                                @lecture.updated_at,
+                                Time.zone.parse(ENV.fetch("RAILS_CACHE_ID", nil)),
+                                Thredded::UserDetail.find_by(user_id: current_user.id)
+                                                    &.last_seen_at || @lecture.updated_at,
+                                @lecture.forum&.updated_at || @lecture.updated_at].max)
+        @lecture = Lecture.includes(:teacher, :term, :editors, :users,
+                                    :announcements, :imported_media,
+                                    course: [:editors],
+                                    media: [:teachable, :tags],
+                                    lessons: [media: [:tags]],
+                                    chapters: [:lecture,
+                                               { sections: [lessons: [:tags],
+                                                            chapter: [:lecture],
+                                                            tags: [:notions,
+                                                                   :lessons]] }])
+                          .find_by(id: params[:id])
+        @notifications = current_user.active_notifications(@lecture)
+        @new_topics_count = @lecture.unread_forum_topics_count(current_user) || 0
+
+        render template: "lectures/show/show",
+               layout: turbo_frame_request? ? "turbo_frame" : "application"
+      end
+    end
+
+    def lecture_home_landing_page?
+      @lecture.term.present? &&
+        Flipper.enabled?(:lecture_home_landing, @lecture.term)
     end
 
     def lecture_params
       allowed_params = [:term_id, :start_chapter, :absolute_numbering,
                         :start_section, :organizational, :locale,
-                        :organizational_concept, :muesli,
+                        :organizational_concept, :muesli, :vignettes,
                         :organizational_on_top, :disable_teacher_display,
                         :content_mode, :passphrase, :sort, :comments_disabled,
                         :submission_max_team_size, :submission_grace_period,
-                        :annotations_status]
+                        :annotations_status,
+                        :home_intro, :home_attachment, :remove_home_attachment]
       if action_name == "update" && current_user.can_update_personell?(@lecture)
         allowed_params.push({ editor_ids: [] })
       end
@@ -407,6 +477,13 @@ class LecturesController < ApplicationController
                                 lecture: @lecture)
                           .new_lecture_email.deliver_later
       end
+    end
+
+    def lecture_destruction_error
+      required_elsewhere = @lecture.registration_campaigns.any?(&:required_by_other_campaign?)
+      return t("controllers.lectures.destruction_failed_prerequisite") if required_elsewhere
+
+      t("controllers.lectures.destruction_failed")
     end
 
     # destroy all notifications related to this lecture
@@ -449,7 +526,7 @@ class LecturesController < ApplicationController
 
     def search_params
       params.expect(search: [:all_types, :all_terms, :all_programs,
-                             :all_teachers, :fulltext, :per,
+                             :all_teachers, :fulltext, :per, :term_scope,
                              { types: [],
                                term_ids: [],
                                program_ids: [],

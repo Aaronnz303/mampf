@@ -7,7 +7,7 @@ class RegistrationsController < Devise::RegistrationsController
 
   def create
     altcha_param = params.permit(:altcha)[:altcha]
-    if altcha_param.present? && AltchaSolution.verify_and_save(altcha_param)
+    if altcha_param.present? && Altcha.verify(altcha_param)
       super
     else
       build_resource(devise_parameter_sanitizer.sanitize(:sign_up))
@@ -42,9 +42,29 @@ class RegistrationsController < Devise::RegistrationsController
     end
   end
 
-  def after_sign_up_path_for(_resource)
-    edit_profile_path
-  end
+  protected
+
+    def after_sign_up_path_for(_resource)
+      edit_profile_path
+    end
+
+    # Devise drops blank password fields before saving, so an empty submit would
+    # report success and put the user back on the same form.
+    def update_resource(resource, params)
+      if resource.password_change_required? && params[:password].blank?
+        resource.errors.add(:password, :blank)
+        return false
+      end
+
+      super
+    end
+
+    def after_update_path_for(resource)
+      return super unless session[:enforce_password_change]
+      return edit_user_registration_path if resource.password_change_required?
+
+      after_password_change_path_for(resource)
+    end
 
   private
 

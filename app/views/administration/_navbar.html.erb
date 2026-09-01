@@ -1,11 +1,14 @@
 <% I18n.with_locale(current_user.try(:locale)) do %>
 <%= vite_stylesheet_tag "styles/navbar.scss" %>
 
+<%= render partial: "shared/announcement_banner" %>
+
 <div class="admin-navbars-container">
   <nav class="navbar navbar-expand" id="first-admin-nav">
     <%= link_to image_tag("/images/mampf-logo.svg",
                           class: 'me-2',
-                          id: 'mampf-logo'),
+                          id: 'mampf-logo',
+                          width: 35, height: 35),
                 exit_administration_path,
                 title: t('admin.navbar.exit'),
                 data: { 'bs-toggle': 'tooltip' } %>
@@ -45,11 +48,11 @@
       <li class="nav-item">
         <%= link_to '', destroy_user_session_path,
                   class: 'nav-link bi bi-box-arrow-right',
-                  data: { 'bs-toggle': 'tooltip', method: 'delete', turbo: false },
+                  data: { 'bs-toggle': 'tooltip', turbo_method: 'delete' },
                   title: t('admin.navbar.logout') %>
       </li>
 
-      <% if Rails.env.development? %>
+      <% if Rails.env.local? %>
         <%= render partial: "dev/impersonate_dropdown" %>
       <% end %>
     </ul>

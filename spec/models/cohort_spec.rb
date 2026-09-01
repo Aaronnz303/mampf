@@ -5,6 +5,10 @@ RSpec.describe(Cohort, type: :model) do
     expect(build(:cohort)).to be_valid
   end
 
+  it "is not roster-exclusive within a lecture (memberships can coexist)" do
+    expect(build(:cohort).roster_exclusive_within_lecture?).to be(false)
+  end
+
   describe "validations" do
     it "is invalid without a title" do
       cohort = build(:cohort, title: nil)
@@ -86,6 +90,19 @@ RSpec.describe(Cohort, type: :model) do
     it "returns nil for lecture if context is not a Lecture" do
       cohort = build(:cohort, context: nil)
       expect(cohort.lecture).to be_nil
+    end
+  end
+
+  describe "#lecture_id" do
+    it "returns the context id if the context is a Lecture" do
+      lecture = create(:lecture)
+      cohort = build(:cohort, context: lecture)
+      expect(cohort.lecture_id).to eq(lecture.id)
+    end
+
+    it "returns nil if the context is not a Lecture" do
+      cohort = build(:cohort, context: create(:course))
+      expect(cohort.lecture_id).to be_nil
     end
   end
 

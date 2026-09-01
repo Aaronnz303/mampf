@@ -81,6 +81,15 @@ RSpec.describe(Registration::Campaign, type: :model) do
       expect(campaign.registration_policies.count).to eq(1)
       expect(campaign.registration_policies.first.kind).to eq("institutional_email")
     end
+
+    it "creates campaign with prerequisite_campaign_id match" do
+      parent = create(:registration_campaign, :open, :with_items)
+      child  = create(:registration_campaign, :open, :with_items, :with_prerequisite_policy,
+                      parent_campaign: parent)
+
+      policy = child.registration_policies.find_by(kind: :prerequisite_campaign)
+      expect(policy.config["prerequisite_campaign_id"]).to eq(parent.id)
+    end
   end
 
   describe "validations" do
@@ -176,10 +185,45 @@ RSpec.describe(Registration::Campaign, type: :model) do
   end
 
   describe "deletion protection" do
-    it "prevents deletion if not draft" do
-      campaign = create(:registration_campaign, :open)
+    it "prevents deletion while the allocation is being processed" do
+      campaign = create(:registration_campaign, :processing)
       expect { campaign.destroy }.not_to change(Registration::Campaign, :count)
       expect(campaign.errors.added?(:base, :cannot_delete_active_campaign)).to be(true)
+    end
+
+    it "allows deletion of a finalized campaign that reached nobody" do
+      campaign = create(:registration_campaign, :completed)
+
+      expect { campaign.destroy }.to change(Registration::Campaign, :count).by(-1)
+    end
+
+    it "prevents deletion if students have registered" do
+      campaign = create(:registration_campaign, :open)
+      create(:registration_user_registration,
+             registration_campaign: campaign,
+             registration_item: campaign.registration_items.first)
+
+      expect { campaign.destroy }.not_to change(Registration::Campaign, :count)
+      expect(campaign.errors.added?(:base, :cannot_discard_with_registrations)).to be(true)
+    end
+
+    # A computed allocation over nobody allocated nobody; only what reached a
+    # roster is worth protecting, and that is the example below.
+    it "allows deletion when only the allocation timestamp is set" do
+      campaign = create(:registration_campaign, :closed)
+      campaign.update_columns(last_allocation_calculated_at: Time.current) # rubocop:disable Rails/SkipsModelValidations
+
+      expect { campaign.destroy }.to change(Registration::Campaign, :count).by(-1)
+    end
+
+    it "prevents deletion once an allocation has been materialized" do
+      campaign = create(:registration_campaign, :closed)
+      create(:tutorial_membership,
+             tutorial: campaign.registration_items.first.registerable,
+             source_campaign_id: campaign.id)
+
+      expect { campaign.destroy }.not_to change(Registration::Campaign, :count)
+      expect(campaign.errors.added?(:base, :cannot_discard_after_allocation)).to be(true)
     end
 
     it "prevents deletion if referenced as prerequisite" do
@@ -204,10 +248,15 @@ RSpec.describe(Registration::Campaign, type: :model) do
       expect(campaign.errors.added?(:allocation_mode, :frozen)).to be(true)
     end
 
-    it "prevents reverting to draft from open" do
+    it "prevents reverting to draft once a student has registered" do
+      create(:registration_user_registration,
+             registration_campaign: campaign,
+             registration_item: campaign.registration_items.first)
+
       campaign.status = :draft
       expect(campaign).not_to be_valid
-      expect(campaign.errors.added?(:status, :cannot_revert_to_draft)).to be(true)
+      expect(campaign.errors.added?(:base, :cannot_revert_with_registrations))
+        .to be(true)
     end
 
     it "allows changing allocation_mode if draft" do
@@ -391,7 +440,7 @@ RSpec.describe(Registration::Campaign, type: :model) do
       end
     end
 
-    context "with FCFS campaign" do
+    context "with first-come-first-served campaign" do
       let(:campaign) { create(:registration_campaign, :with_items, :first_come_first_served) }
       let(:item1) { campaign.registration_items.first }
 
@@ -448,6 +497,87 @@ RSpec.describe(Registration::Campaign, type: :model) do
 
         campaign.finalize!
       end
+    end
+
+    context "with FCFS policy auto-rejections" do
+      let(:campaign) do
+        create(:registration_campaign, :with_items, :first_come_first_served)
+      end
+      let(:item) { campaign.registration_items.first }
+      let!(:policy) do
+        create(:registration_policy,
+               :institutional_email,
+               :for_finalization,
+               registration_campaign: campaign,
+               config: { "allowed_domains" => "uni.edu" })
+      end
+
+      before do
+        campaign.update!(status: :closed)
+      end
+
+      it "applies policy rejection reasons to pending FCFS rows" do
+        registration = create(:registration_user_registration,
+                              :pending,
+                              registration_campaign: campaign,
+                              registration_item: item,
+                              user: create(:confirmed_user, email: "invalid@other.test"))
+
+        campaign.finalize!
+
+        expect(registration.reload).to be_rejected
+        expect(registration.rejection_reason_type).to eq("policy")
+        expect(registration.rejection_reason_code).to eq("institutional_email_mismatch")
+        expect(registration.rejection_policy).to eq(policy)
+      end
+
+      it "raises a finalization blocked error when screening finds blockers" do
+        policy = build(:registration_policy,
+                       :institutional_email,
+                       :for_finalization,
+                       registration_campaign: campaign,
+                       config: { "allowed_domains" => "" })
+        policy.save!(validate: false)
+
+        create(:registration_user_registration,
+               :pending,
+               registration_campaign: campaign,
+               registration_item: item,
+               user: create(:confirmed_user, email: "student@other.test"))
+
+        expect do
+          campaign.finalize!
+        end.to raise_error(Registration::Campaign::FinalizationBlockedError)
+      end
+    end
+  end
+
+  describe "#apply_rejections!" do
+    let(:campaign) { create(:registration_campaign, :with_items, :preference_based) }
+    let(:item) { campaign.registration_items.first }
+
+    it "bulk-loads registrations before rejecting them" do
+      registration = create(:registration_user_registration,
+                            registration_campaign: campaign,
+                            registration_item: item,
+                            user: create(:confirmed_user),
+                            preference_rank: 1,
+                            status: :pending)
+      relation = campaign.user_registrations
+
+      allow(campaign).to receive(:user_registrations).and_return(relation)
+      expect(relation).not_to receive(:find)
+
+      campaign.apply_rejections!([
+                                   {
+                                     registration_id: registration.id,
+                                     reason_code: :institutional_email_mismatch,
+                                     reason_label: "Email domain not allowed.",
+                                     message: "Email domain not allowed."
+                                   }
+                                 ])
+
+      expect(registration.reload).to be_rejected
     end
   end
 
@@ -507,6 +637,20 @@ RSpec.describe(Registration::Campaign, type: :model) do
       ranks = campaign.user_registrations.reload.order(:preference_rank)
                       .pluck(:preference_rank)
       expect(ranks).to eq([1, 2])
+    end
+
+    it "clears rejection overrides on reset" do
+      registration = create(:registration_user_registration,
+                            registration_campaign: campaign,
+                            registration_item: item1,
+                            user: user,
+                            status: :rejected,
+                            preference_rank: 1,
+                            rejection_overridden_at: Time.current)
+
+      campaign.reset_allocation_results!
+
+      expect(registration.reload.rejection_overridden_at).to be_nil
     end
 
     it "zeroes out confirmed_registrations_count on all items" do
@@ -689,6 +833,105 @@ RSpec.describe(Registration::Campaign, type: :model) do
           .not_to include(other_student)
       end
     end
+
+    context "when a student is still in the open rejected queue" do
+      let(:rejected_student) { create(:user, name: "Rejected Student") }
+
+      before do
+        tutorial = create(:tutorial, lecture: lecture)
+        create(:registration_item,
+               registration_campaign: campaign,
+               registerable: tutorial)
+        create(:registration_user_registration,
+               :rejected,
+               registration_campaign: campaign,
+               registration_item: campaign.registration_items.first,
+               user: rejected_student,
+               rejection_reason_label: "Missing prerequisite")
+      end
+
+      it "excludes rejected students from the unassigned queue" do
+        expect(campaign.unassigned_users(preload_registrations: true))
+          .not_to include(rejected_student)
+      end
+    end
+  end
+
+  describe "#rejected_users" do
+    let(:lecture) { create(:lecture) }
+    let(:campaign) do
+      create(:registration_campaign, :completed, campaignable: lecture)
+    end
+    let(:tutorial) { create(:tutorial, lecture: lecture) }
+    let(:rejected_user) { create(:user, name: "Rejected User") }
+    let(:confirmed_user) { create(:user, name: "Confirmed User") }
+
+    before do
+      create(:registration_item,
+             registration_campaign: campaign,
+             registerable: tutorial)
+      create(:registration_user_registration,
+             :rejected,
+             registration_campaign: campaign,
+             registration_item: campaign.registration_items.first,
+             user: rejected_user,
+             rejection_reason_label: "Missing prerequisite")
+      create(:registration_user_registration,
+             :confirmed,
+             registration_campaign: campaign,
+             registration_item: campaign.registration_items.first,
+             user: confirmed_user)
+    end
+
+    it "returns only users whose final campaign state is rejected" do
+      expect(campaign.rejected_users).to include(rejected_user)
+      expect(campaign.rejected_users).not_to include(confirmed_user)
+    end
+
+    it "preloads registrations when requested" do
+      user = campaign.rejected_users(preload_registrations: true).first
+
+      expect(user.association(:user_registrations)).to be_loaded
+    end
+
+    it "excludes rejected users whose rejection was overridden" do
+      registration = campaign.user_registrations.find_by(user: rejected_user)
+      registration.update!(rejection_overridden_at: Time.current)
+
+      expect(campaign.rejected_users).not_to include(rejected_user)
+      expect(campaign.open_rejected_count).to eq(0)
+      expect(campaign.rejected_count).to eq(1)
+    end
+
+    it "re-includes users when a rejection is reapplied after override" do
+      registration = campaign.user_registrations.find_by(user: rejected_user)
+      registration.update!(rejection_overridden_at: Time.current)
+
+      registration.reject!(
+        reason_type: Registration::UserRegistration::REJECTION_REASON_TYPE_POLICY,
+        reason_code: :institutional_email_mismatch,
+        reason_label: "Email domain not allowed."
+      )
+
+      expect(registration.reload.rejection_overridden_at).to be_nil
+      expect(campaign.rejected_users).to include(rejected_user)
+      expect(campaign.open_rejected_count).to eq(1)
+    end
+
+    it "excludes solver-unassigned users from the rejected queue" do
+      registration = campaign.user_registrations.find_by(user: rejected_user)
+      registration.update!(
+        rejection_reason_code: Registration::UserRegistration::REJECTION_REASON_CODE_SOLVER_UNASSIGNED,
+        rejection_reason_label: I18n.t(
+          "registration.user_registration.reason_labels.solver_unassigned"
+        )
+      )
+
+      expect(campaign.rejected_users).not_to include(rejected_user)
+      expect(campaign.open_rejected_count).to eq(0)
+      expect(campaign.rejected_count).to eq(1)
+      expect(campaign.unassigned_users(preload_registrations: true)).to include(rejected_user)
+    end
   end
 
   describe "#roster_group_type" do
@@ -763,6 +1006,260 @@ RSpec.describe(Registration::Campaign, type: :model) do
       expect(tutorial.skip_campaigns).to be(true)
       expect(tutorial).not_to be_locked
       expect(tutorial).to be_valid
+    end
+  end
+
+  describe "#apply_self_materialization_mode!" do
+    it "sets the mode on all of the campaign's groups once completed" do
+      campaign = create(:registration_campaign, :completed,
+                        :first_come_first_served, items_count: 2)
+
+      campaign.apply_self_materialization_mode!("add_and_remove")
+
+      modes = campaign.registerables.map(&:self_materialization_mode).uniq
+      expect(modes).to eq(["add_and_remove"])
+    end
+
+    it "does nothing while the campaign is not completed" do
+      campaign = create(:registration_campaign, :first_come_first_served,
+                        :with_items, items_count: 2)
+
+      expect(campaign.apply_self_materialization_mode!("add_and_remove"))
+        .to be(false)
+      expect(campaign.registerables.map(&:self_materialization_mode).uniq)
+        .to eq(["disabled"])
+    end
+
+    it "rejects an unknown mode without touching the current modes" do
+      campaign = create(:registration_campaign, :completed,
+                        :first_come_first_served, items_count: 2)
+      campaign.registerables.each do |group|
+        group.update!(self_materialization_mode: :add_only)
+      end
+
+      expect { campaign.apply_self_materialization_mode!("nonsense") }
+        .to raise_error(ArgumentError)
+      expect(campaign.registerables.map(&:self_materialization_mode).uniq)
+        .to eq(["add_only"])
+    end
+
+    it "rejects a missing mode with an ArgumentError, not a NoMethodError" do
+      campaign = create(:registration_campaign, :completed,
+                        :first_come_first_served, items_count: 2)
+      campaign.registerables.each do |group|
+        group.update!(self_materialization_mode: :add_only)
+      end
+
+      expect { campaign.apply_self_materialization_mode!(nil) }
+        .to raise_error(ArgumentError)
+      expect(campaign.registerables.map(&:self_materialization_mode).uniq)
+        .to eq(["add_only"])
+    end
+  end
+
+  describe "#shared_self_materialization_mode" do
+    it "returns the common mode when all groups agree" do
+      campaign = create(:registration_campaign, :with_items, items_count: 2)
+
+      expect(campaign.shared_self_materialization_mode).to eq("disabled")
+    end
+
+    it "returns nil when the groups differ" do
+      campaign = create(:registration_campaign, :completed,
+                        :first_come_first_served, items_count: 2)
+      first, second = campaign.registerables.to_a
+      first.update!(self_materialization_mode: :add_only)
+      second.update!(self_materialization_mode: :disabled)
+
+      expect(campaign.shared_self_materialization_mode).to be_nil
+    end
+  end
+  describe "#discardable?" do
+    it "is true for a draft campaign" do
+      expect(create(:registration_campaign)).to be_discardable
+    end
+
+    it "is true for an open campaign nobody has registered for" do
+      expect(create(:registration_campaign, :open)).to be_discardable
+    end
+
+    it "is true for a closed campaign nobody has registered for" do
+      expect(create(:registration_campaign, :closed)).to be_discardable
+    end
+
+    it "is false while the allocation is being processed" do
+      expect(create(:registration_campaign, :processing)).not_to be_discardable
+    end
+
+    # completed no longer bars discarding by itself; the checks below do.
+    it "is true for a finalized campaign nobody registered for" do
+      expect(create(:registration_campaign, :completed)).to be_discardable
+    end
+
+    it "is false for a finalized campaign somebody registered for" do
+      campaign = create(:registration_campaign, :completed)
+      create(:registration_user_registration,
+             registration_campaign: campaign,
+             registration_item: campaign.registration_items.first)
+
+      expect(campaign).not_to be_discardable
+      expect(campaign.discard_blocker).to eq(:registrations)
+    end
+
+    it "is false for a finalized campaign whose allocation reached a roster" do
+      campaign = create(:registration_campaign, :completed)
+      create(:tutorial_membership,
+             tutorial: campaign.registration_items.first.registerable,
+             source_campaign: campaign)
+
+      expect(campaign).not_to be_discardable
+      expect(campaign.discard_blocker).to eq(:allocation)
+    end
+
+    it "is false with a rejected registration" do
+      campaign = create(:registration_campaign, :open)
+      create(:registration_user_registration, :rejected,
+             registration_campaign: campaign,
+             registration_item: campaign.registration_items.first)
+
+      expect(campaign).not_to be_discardable
+      expect(campaign.discard_blocker).to eq(:registrations)
+    end
+
+    it "is false when another campaign depends on it" do
+      prereq = create(:registration_campaign)
+      dependent = create(:registration_campaign)
+      create(:registration_policy, :prerequisite_campaign,
+             registration_campaign: dependent,
+             config: { "prerequisite_campaign_id" => prereq.id })
+
+      expect(prereq).not_to be_discardable
+      expect(prereq.discard_blocker).to eq(:prerequisite)
+    end
+  end
+
+  describe "discarding" do
+    let(:campaign) { create(:registration_campaign, :with_items) }
+
+    it "deletes items and policies but keeps the groups" do
+      create(:registration_policy, :institutional_email, registration_campaign: campaign)
+      campaign.update!(status: :open)
+      tutorials = campaign.registerables
+
+      expect { campaign.destroy }.to change(Registration::Item, :count).by(-3)
+      expect(Registration::Policy.where(registration_campaign_id: campaign.id)).to be_empty
+
+      expect(Tutorial.where(id: tutorials.map(&:id)).count).to eq(3)
+      expect(tutorials.map { |t| t.reload.skip_campaigns }).to all(be(true))
+    end
+  end
+
+  describe "blocker messages" do
+    # Both guards look their blocker up with fetch, so a fifth reason added to
+    # data_blocker fails here rather than letting a campaign through.
+    it "cover every reason the two rules can report" do
+      reported = [:status, :registrations, :allocation, :prerequisite]
+
+      expect(described_class::DISCARD_BLOCKER_ERRORS.keys).to match_array(reported)
+      expect(described_class::REVERT_BLOCKER_ERRORS.keys).to match_array(reported)
+    end
+  end
+
+  describe "#revertible_to_draft?" do
+    it "is true for an open campaign nobody has registered for" do
+      expect(create(:registration_campaign, :open)).to be_revertible_to_draft
+    end
+
+    it "is true for a closed campaign nobody has registered for" do
+      expect(create(:registration_campaign, :closed)).to be_revertible_to_draft
+    end
+
+    it "is false for a draft campaign, which is already there" do
+      campaign = create(:registration_campaign)
+
+      expect(campaign).not_to be_revertible_to_draft
+      expect(campaign.revert_blocker).to eq(:status)
+    end
+
+    it "is false while the allocation is being processed" do
+      expect(create(:registration_campaign, :processing)).not_to be_revertible_to_draft
+    end
+
+    it "is false once finalized" do
+      expect(create(:registration_campaign, :completed)).not_to be_revertible_to_draft
+    end
+
+    it "is false with a registration of any status" do
+      campaign = create(:registration_campaign, :open)
+      create(:registration_user_registration, :rejected,
+             registration_campaign: campaign,
+             registration_item: campaign.registration_items.first)
+
+      expect(campaign).not_to be_revertible_to_draft
+      expect(campaign.revert_blocker).to eq(:registrations)
+    end
+
+    it "is false once an allocation reached a roster" do
+      campaign = create(:registration_campaign, :open)
+      create(:tutorial_membership,
+             tutorial: campaign.registration_items.first.registerable,
+             source_campaign: campaign)
+
+      expect(campaign.reload).not_to be_revertible_to_draft
+      expect(campaign.revert_blocker).to eq(:allocation)
+    end
+
+    it "is false when another campaign depends on it" do
+      prereq = create(:registration_campaign, :open)
+      dependent = create(:registration_campaign)
+      create(:registration_policy, :prerequisite_campaign,
+             registration_campaign: dependent,
+             config: { "prerequisite_campaign_id" => prereq.id })
+
+      expect(prereq).not_to be_revertible_to_draft
+      expect(prereq.revert_blocker).to eq(:prerequisite)
+    end
+  end
+
+  describe "reverting to draft" do
+    it "unfreezes the configuration again" do
+      campaign = create(:registration_campaign, :open, :first_come_first_served)
+
+      expect(campaign.update(status: :draft)).to be(true)
+
+      expect(campaign.reload).to be_draft
+      expect(campaign.update(allocation_mode: :preference_based)).to be(true)
+    end
+
+    it "lets the last remaining item be removed afterwards" do
+      campaign = create(:registration_campaign, :with_items, items_count: 1)
+      campaign.update!(status: :open)
+      item = campaign.registration_items.first
+
+      expect(item.removal_blocker).to eq(:last_item)
+
+      campaign.update!(status: :draft)
+
+      expect(item.reload.removal_blocker).to be_nil
+    end
+
+    it "is refused once a student has registered" do
+      campaign = create(:registration_campaign, :open)
+      create(:registration_user_registration,
+             registration_campaign: campaign,
+             registration_item: campaign.registration_items.first)
+
+      expect(campaign.update(status: :draft)).to be(false)
+      expect(campaign.errors.added?(:base, :cannot_revert_with_registrations))
+        .to be(true)
+      expect(campaign.reload).to be_open
+    end
+
+    it "is refused from processing" do
+      campaign = create(:registration_campaign, :processing)
+
+      expect(campaign.update(status: :draft)).to be(false)
+      expect(campaign.reload).to be_processing
     end
   end
 end

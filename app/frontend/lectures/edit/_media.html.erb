@@ -1,3 +1,8 @@
+<% lecture_medium_highlight_actions = [
+  "mouseenter->lecture-highlights#highlightMedium",
+  "mouseleave->lecture-highlights#resetMedium"
+].join(" ") %>
+
 <% cache media do%>
 <div class="card bg-mdb-color-lighten-6" data-controller="media-button-sort">
   <div class="card-header">
@@ -32,6 +37,7 @@
       <div class="col-2 text-end">
         <i id="hide-media-button"
            class="far fa-window-close clickable"
+           data-action="click->lecture-edit#hideMedia"
            data-bs-toggle="tooltip"
            title="<%= t('buttons.hide_media') %>">
         </i>
@@ -43,7 +49,7 @@
       <div class="col-5">
         <ul class="nav flex-column nav-pills"
             role="tablist">
-          <% media_sorts(lecture).each do |s| %>
+          <% media_sorts.each do |s| %>
             <li class="nav-item w-100">
               <a class="nav-link <%= active(s == 'lesson_material') %>"
                  id="<%= s %>-tab"
@@ -60,7 +66,7 @@
       </div>
       <div class="col-7">
         <div class="tab-content">
-          <% media_sorts(lecture).each do |s| %>
+          <% media_sorts.each do |s| %>
             <div class="tab-pane fade <%= show_tab(s == 'lesson_material') %>"
                  id="<%= s %>-media"
                  role="tabpanel"
@@ -80,6 +86,7 @@
                                 data: { type: m.teachable.class.to_s,
                                         id: m.teachable.id,
                                         tags: m.tags.pluck(:id),
+                                      action: lecture_medium_highlight_actions,
                                         toggle: 'tooltip' } %>
                   </li>
                 <% end %>

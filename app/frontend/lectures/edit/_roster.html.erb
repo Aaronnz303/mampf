@@ -1,7 +1,16 @@
 <% group_type ||= :all %>
+<% roster_params = { group_type: group_type } %>
+<% selected_section =
+     RegistrationCampaignsCardBodyIndexComponent.normalize_registration_section(
+     params[:registration_section]
+   ) %>
+<% if selected_section.present? %>
+  <% roster_params[:registration_section] = selected_section %>
+<% end %>
+
 <div class="col-12">
   <%= turbo_frame_tag roster_maintenance_frame_id(group_type),
-                      src: lecture_roster_path(lecture, group_type: group_type),
+                      src: lecture_roster_path(lecture, roster_params),
                       loading: "lazy" do %>
     <div class="text-center my-5">
       <div class="spinner-border" role="status">
@@ -9,4 +18,10 @@
       </div>
     </div>
   <% end %>
+
+  <p class="text-muted small mt-3">
+    <%= t("registration.student_message.crosslink_html",
+          link: link_to(t("admin.lecture.communication"),
+                        edit_lecture_path(lecture, tab: "communication"))) %>
+  </p>
 </div>

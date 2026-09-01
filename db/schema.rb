@@ -10,7 +10,7 @@
 #
 # It's strongly recommended that you check this file into your version control system.
 
-ActiveRecord::Schema[8.0].define(version: 2026_04_16_000000) do
+ActiveRecord::Schema[8.0].define(version: 2026_08_29_000002) do
   # These are extensions that must be enabled in order to support this database
   enable_extension "pg_catalog.plpgsql"
   enable_extension "pg_trgm"
@@ -53,17 +53,6 @@ ActiveRecord::Schema[8.0].define(version: 2026_04_16_000000) do
     t.bigint "blob_id", null: false
     t.string "variation_digest", null: false
     t.index ["blob_id", "variation_digest"], name: "index_active_storage_variant_records_uniqueness", unique: true
-  end
-
-  create_table "altcha_solutions", force: :cascade do |t|
-    t.string "algorithm"
-    t.string "challenge"
-    t.string "salt"
-    t.string "signature"
-    t.integer "number"
-    t.datetime "created_at", null: false
-    t.datetime "updated_at", null: false
-    t.index ["algorithm", "challenge", "salt", "signature", "number"], name: "index_altcha_solutions", unique: true
   end
 
   create_table "annotations", force: :cascade do |t|
@@ -403,6 +392,9 @@ ActiveRecord::Schema[8.0].define(version: 2026_04_16_000000) do
     t.boolean "legacy_seminar", default: false
     t.integer "annotations_status", default: 1, null: false
     t.integer "self_materialization_mode", default: 0, null: false
+    t.text "home_intro"
+    t.text "home_attachment_data"
+    t.boolean "vignettes", default: false, null: false
     t.index ["released"], name: "index_lectures_on_released"
     t.index ["sort"], name: "index_lectures_on_sort"
     t.index ["teacher_id"], name: "index_lectures_on_teacher_id"
@@ -590,6 +582,7 @@ ActiveRecord::Schema[8.0].define(version: 2026_04_16_000000) do
     t.datetime "created_at", null: false
     t.datetime "updated_at", null: false
     t.datetime "last_allocation_calculated_at"
+    t.datetime "allocation_decided_at"
     t.index ["allocation_mode"], name: "index_registration_campaigns_on_allocation_mode"
     t.index ["campaignable_type", "campaignable_id"], name: "index_registration_campaigns_on_campaignable"
     t.index ["status"], name: "index_registration_campaigns_on_status"
@@ -611,7 +604,7 @@ ActiveRecord::Schema[8.0].define(version: 2026_04_16_000000) do
     t.integer "phase", default: 0, null: false
     t.integer "position"
     t.boolean "active", default: true, null: false
-    t.jsonb "config", default: {}
+    t.jsonb "config", default: {}, null: false
     t.datetime "created_at", null: false
     t.datetime "updated_at", null: false
     t.uuid "registration_campaign_id", null: false
@@ -620,6 +613,20 @@ ActiveRecord::Schema[8.0].define(version: 2026_04_16_000000) do
     t.index ["phase"], name: "index_registration_policies_on_phase"
     t.index ["registration_campaign_id", "position"], name: "index_registration_policies_position"
     t.index ["registration_campaign_id"], name: "index_registration_policies_on_registration_campaign_id"
+  end
+
+  create_table "registration_student_messages", force: :cascade do |t|
+    t.bigint "lecture_id", null: false
+    t.bigint "sender_id", null: false
+    t.string "subject", null: false
+    t.text "body", null: false
+    t.text "attachment_data"
+    t.string "recipient_emails", default: [], null: false, array: true
+    t.integer "recipients_count", default: 0, null: false
+    t.datetime "created_at", null: false
+    t.datetime "updated_at", null: false
+    t.index ["lecture_id"], name: "index_registration_student_messages_on_lecture_id"
+    t.index ["sender_id"], name: "index_registration_student_messages_on_sender_id"
   end
 
   create_table "registration_user_registrations", id: :uuid, default: -> { "gen_random_uuid()" }, force: :cascade do |t|
@@ -631,10 +638,20 @@ ActiveRecord::Schema[8.0].define(version: 2026_04_16_000000) do
     t.uuid "registration_campaign_id", null: false
     t.uuid "registration_item_id", null: false
     t.datetime "materialized_at"
+    t.boolean "exclusive_assignment", default: false, null: false
+    t.string "rejection_reason_type"
+    t.string "rejection_reason_code"
+    t.string "rejection_reason_label"
+    t.datetime "rejected_at"
+    t.datetime "rejection_overridden_at"
+    t.uuid "rejection_policy_id"
     t.index ["registration_campaign_id", "user_id", "preference_rank"], name: "index_reg_user_regs_unique_ranked", unique: true, where: "(preference_rank IS NOT NULL)"
-    t.index ["registration_campaign_id", "user_id"], name: "index_reg_user_regs_unique_unranked", unique: true, where: "(preference_rank IS NULL)"
+    t.index ["registration_campaign_id", "user_id", "registration_item_id"], name: "index_reg_user_regs_unique_item_user", unique: true
+    t.index ["registration_campaign_id", "user_id"], name: "index_reg_user_regs_unique_exclusive_assignment_unranked", unique: true, where: "((exclusive_assignment = true) AND (preference_rank IS NULL))"
     t.index ["registration_campaign_id"], name: "index_reg_user_regs_on_campaign_id"
     t.index ["registration_item_id"], name: "index_registration_user_registrations_on_registration_item_id"
+    t.index ["rejection_overridden_at"], name: "index_reg_user_regs_on_rejection_overridden_at"
+    t.index ["rejection_policy_id"], name: "index_registration_user_registrations_on_rejection_policy_id"
     t.index ["status"], name: "index_registration_user_registrations_on_status"
     t.index ["user_id"], name: "index_registration_user_registrations_on_user_id"
   end
@@ -1006,8 +1023,10 @@ ActiveRecord::Schema[8.0].define(version: 2026_04_16_000000) do
     t.uuid "source_campaign_id"
     t.datetime "created_at", null: false
     t.datetime "updated_at", null: false
+    t.bigint "lecture_id", null: false
     t.index ["source_campaign_id"], name: "index_tutorial_memberships_on_source_campaign_id"
     t.index ["tutorial_id"], name: "index_tutorial_memberships_on_tutorial_id"
+    t.index ["user_id", "lecture_id"], name: "index_tutorial_memberships_on_user_id_and_lecture_id", unique: true
     t.index ["user_id", "tutorial_id"], name: "index_tutorial_memberships_on_user_id_and_tutorial_id", unique: true
     t.index ["user_id"], name: "index_tutorial_memberships_on_user_id"
   end
@@ -1054,7 +1073,7 @@ ActiveRecord::Schema[8.0].define(version: 2026_04_16_000000) do
     t.datetime "updated_at", precision: nil, null: false
     t.boolean "admin"
     t.integer "subscription_type"
-    t.boolean "consents"
+    t.boolean "consents", default: false, null: false
     t.datetime "consented_at", precision: nil
     t.text "name"
     t.text "homepage"
@@ -1086,9 +1105,14 @@ ActiveRecord::Schema[8.0].define(version: 2026_04_16_000000) do
     t.string "current_sign_in_ip"
     t.string "last_sign_in_ip"
     t.date "deletion_date"
+    t.integer "failed_attempts", default: 0, null: false
+    t.string "unlock_token"
+    t.integer "password_policy_version", default: 0, null: false
+    t.datetime "password_changed_at"
     t.index ["confirmation_token"], name: "index_users_on_confirmation_token", unique: true
     t.index ["email"], name: "index_users_on_email", unique: true
     t.index ["reset_password_token"], name: "index_users_on_reset_password_token", unique: true
+    t.index ["unlock_token"], name: "index_users_on_unlock_token", unique: true
   end
 
   create_table "vignettes_answers", force: :cascade do |t|
@@ -1102,6 +1126,7 @@ ActiveRecord::Schema[8.0].define(version: 2026_04_16_000000) do
     t.datetime "updated_at", null: false
     t.index ["vignettes_question_id"], name: "index_vignettes_answers_on_vignettes_question_id"
     t.index ["vignettes_slide_id"], name: "index_vignettes_answers_on_vignettes_slide_id"
+    t.index ["vignettes_user_answer_id", "vignettes_slide_id"], name: "index_vignettes_answers_on_run_and_slide", unique: true
     t.index ["vignettes_user_answer_id"], name: "index_vignettes_answers_on_vignettes_user_answer_id"
   end
 
@@ -1113,20 +1138,10 @@ ActiveRecord::Schema[8.0].define(version: 2026_04_16_000000) do
   end
 
   create_table "vignettes_codenames", force: :cascade do |t|
-    t.string "pseudonym"
-    t.bigint "user_id"
-    t.bigint "lecture_id"
+    t.string "pseudonym", null: false
     t.datetime "created_at", null: false
     t.datetime "updated_at", null: false
-    t.index ["lecture_id"], name: "index_vignettes_codenames_on_lecture_id"
-    t.index ["user_id"], name: "index_vignettes_codenames_on_user_id"
-  end
-
-  create_table "vignettes_completion_messages", force: :cascade do |t|
-    t.bigint "lecture_id", null: false
-    t.datetime "created_at", null: false
-    t.datetime "updated_at", null: false
-    t.index ["lecture_id"], name: "index_vignettes_completion_messages_on_lecture_id"
+    t.index ["pseudonym"], name: "index_vignettes_codenames_on_pseudonym", unique: true
   end
 
   create_table "vignettes_info_slides", force: :cascade do |t|
@@ -1160,6 +1175,7 @@ ActiveRecord::Schema[8.0].define(version: 2026_04_16_000000) do
     t.boolean "editable", default: true
     t.datetime "created_at", null: false
     t.datetime "updated_at", null: false
+    t.boolean "data_collection", default: false, null: false
     t.index ["lecture_id"], name: "index_vignettes_questionnaires_on_lecture_id"
   end
 
@@ -1177,8 +1193,7 @@ ActiveRecord::Schema[8.0].define(version: 2026_04_16_000000) do
   end
 
   create_table "vignettes_slide_statistics", force: :cascade do |t|
-    t.bigint "user_id", null: false
-    t.bigint "vignettes_answer_id"
+    t.bigint "vignettes_answer_id", null: false
     t.integer "time_on_slide"
     t.integer "total_time_on_slide"
     t.text "time_on_info_slides"
@@ -1186,7 +1201,6 @@ ActiveRecord::Schema[8.0].define(version: 2026_04_16_000000) do
     t.text "info_slides_first_access_time"
     t.datetime "created_at", null: false
     t.datetime "updated_at", null: false
-    t.index ["user_id"], name: "index_vignettes_slide_statistics_on_user_id"
     t.index ["vignettes_answer_id"], name: "index_vignettes_slide_statistics_on_vignettes_answer_id"
   end
 
@@ -1201,11 +1215,11 @@ ActiveRecord::Schema[8.0].define(version: 2026_04_16_000000) do
   end
 
   create_table "vignettes_user_answers", force: :cascade do |t|
-    t.bigint "user_id", null: false
     t.bigint "vignettes_questionnaire_id", null: false
     t.datetime "created_at", null: false
     t.datetime "updated_at", null: false
-    t.index ["user_id"], name: "index_vignettes_user_answers_on_user_id"
+    t.bigint "vignettes_codename_id", null: false
+    t.index ["vignettes_codename_id"], name: "index_vignettes_user_answers_on_vignettes_codename_id"
     t.index ["vignettes_questionnaire_id"], name: "index_vignettes_user_answers_on_vignettes_questionnaire_id"
   end
 
@@ -1235,13 +1249,6 @@ ActiveRecord::Schema[8.0].define(version: 2026_04_16_000000) do
     t.datetime "updated_at", null: false
     t.index ["lecture_id"], name: "index_vouchers_on_lecture_id"
     t.index ["secure_hash"], name: "index_vouchers_on_secure_hash", unique: true
-  end
-
-  create_table "vtt_containers", force: :cascade do |t|
-    t.text "table_of_contents_data"
-    t.text "references_data"
-    t.datetime "created_at", null: false
-    t.datetime "updated_at", null: false
   end
 
   create_table "watchlist_entries", force: :cascade do |t|
@@ -1304,8 +1311,11 @@ ActiveRecord::Schema[8.0].define(version: 2026_04_16_000000) do
   add_foreign_key "referrals", "media"
   add_foreign_key "registration_items", "registration_campaigns"
   add_foreign_key "registration_policies", "registration_campaigns"
+  add_foreign_key "registration_student_messages", "lectures"
+  add_foreign_key "registration_student_messages", "users", column: "sender_id"
   add_foreign_key "registration_user_registrations", "registration_campaigns"
   add_foreign_key "registration_user_registrations", "registration_items"
+  add_foreign_key "registration_user_registrations", "registration_policies", column: "rejection_policy_id"
   add_foreign_key "registration_user_registrations", "users"
   add_foreign_key "speaker_talk_joins", "registration_campaigns", column: "source_campaign_id"
   add_foreign_key "speaker_talk_joins", "talks"
@@ -1321,6 +1331,7 @@ ActiveRecord::Schema[8.0].define(version: 2026_04_16_000000) do
   add_foreign_key "thredded_user_post_notifications", "users", on_delete: :cascade
   add_foreign_key "tutor_tutorial_joins", "tutorials"
   add_foreign_key "tutor_tutorial_joins", "users", column: "tutor_id"
+  add_foreign_key "tutorial_memberships", "lectures"
   add_foreign_key "tutorial_memberships", "registration_campaigns", column: "source_campaign_id"
   add_foreign_key "tutorial_memberships", "tutorials"
   add_foreign_key "tutorial_memberships", "users"
@@ -1331,16 +1342,12 @@ ActiveRecord::Schema[8.0].define(version: 2026_04_16_000000) do
   add_foreign_key "vignettes_answers", "vignettes_questions"
   add_foreign_key "vignettes_answers", "vignettes_slides"
   add_foreign_key "vignettes_answers", "vignettes_user_answers"
-  add_foreign_key "vignettes_codenames", "lectures"
-  add_foreign_key "vignettes_codenames", "users"
-  add_foreign_key "vignettes_completion_messages", "lectures"
   add_foreign_key "vignettes_options", "vignettes_questions"
   add_foreign_key "vignettes_questionnaires", "lectures"
   add_foreign_key "vignettes_questions", "vignettes_slides"
-  add_foreign_key "vignettes_slide_statistics", "users"
   add_foreign_key "vignettes_slide_statistics", "vignettes_answers"
   add_foreign_key "vignettes_slides", "vignettes_questionnaires"
-  add_foreign_key "vignettes_user_answers", "users"
+  add_foreign_key "vignettes_user_answers", "vignettes_codenames"
   add_foreign_key "vignettes_user_answers", "vignettes_questionnaires"
   add_foreign_key "vouchers", "lectures"
   add_foreign_key "watchlist_entries", "media"

@@ -13,6 +13,12 @@ RSpec.describe(Talk, type: :model) do
     expect(FactoryBot.build(:valid_talk)).to be_valid
   end
 
+  it "is not roster-exclusive within a lecture (a student may give " \
+     "several talks)" do
+    expect(FactoryBot.build(:valid_talk).roster_exclusive_within_lecture?)
+      .to be(false)
+  end
+
   # Test validations
   it "is invalid without a lecture" do
     talk = FactoryBot.build(:valid_talk)
@@ -75,58 +81,68 @@ RSpec.describe(Talk, type: :model) do
   end
 
   context "title methods" do
+    around do |example|
+      I18n.with_locale(:en) { example.run }
+    end
+
     before :each do
-      I18n.with_locale(:de) do
-        course = FactoryBot.build(:course, title: "Algebra 1",
-                                           short_title: "Alg1")
-        term = FactoryBot.build(:term, season: "SS", year: 2020)
-        lecture = FactoryBot.build(:seminar, course: course, term: term)
-        FactoryBot.create(:talk, lecture: lecture, title: "total bs")
-        @talk = FactoryBot.create(:talk, lecture: lecture,
-                                         title: "even more bs")
-      end
+      course = FactoryBot.build(:course, title: "Algebra 1",
+                                         short_title: "Alg1")
+      term = FactoryBot.build(:term, season: "SS", year: 2020)
+      lecture = FactoryBot.build(:seminar, course: course, term: term)
+      FactoryBot.create(:talk, lecture: lecture, title: "total bs")
+      @talk = FactoryBot.create(:talk, lecture: lecture,
+                                       title: "even more bs")
     end
 
     describe "#to_label" do
       it "returns the correct label" do
-        I18n.with_locale(:de) do
-          expect(@talk.to_label).to eq("Vortrag 2. even more bs")
-        end
+        expect(@talk.to_label).to eq("Talk 2. even more bs")
       end
     end
 
     describe "#title_for_viewers" do
       it "returns the correct title" do
         expect(@talk.title_for_viewers)
-          .to eq("(S) Alg1 SS 20, Vortrag 2. even more bs")
+          .to eq("(S) Alg1 SS 20, Talk 2. even more bs")
+      end
+
+      it "keeps locale-specific cache entries separate" do
+        expect(@talk.title_for_viewers)
+          .to eq("(S) Alg1 SS 20, Talk 2. even more bs")
+
+        I18n.with_locale(:de) do
+          expect(@talk.title_for_viewers)
+            .to eq("(S) Alg1 SS 20, Vortrag 2. even more bs")
+        end
       end
     end
 
     describe "#long_title" do
       it "returns the correct title" do
         expect(@talk.long_title)
-          .to eq("(S) Alg1 SS 20, Vortrag 2. even more bs")
+          .to eq("(S) Alg1 SS 20, Talk 2. even more bs")
       end
     end
 
     describe "#local_title_for_viewers" do
       it "returns the correct title" do
         expect(@talk.local_title_for_viewers)
-          .to eq("Vortrag 2. even more bs")
+          .to eq("Talk 2. even more bs")
       end
     end
 
     describe "#short_title_with_lecture_date" do
       it "returns the correct title" do
         expect(@talk.short_title_with_lecture_date)
-          .to eq("(S) Alg1 SS 20, Vortrag 2. even more bs")
+          .to eq("(S) Alg1 SS 20, Talk 2. even more bs")
       end
     end
 
     describe "#card_header" do
       it "returns the correct title" do
         expect(@talk.card_header)
-          .to eq("(S) Alg1 SS 20, Vortrag 2. even more bs")
+          .to eq("(S) Alg1 SS 20, Talk 2. even more bs")
       end
     end
 
@@ -254,6 +270,45 @@ RSpec.describe(Talk, type: :model) do
       talk.materialize_allocation!(user_ids: [user.id], campaign: campaign)
 
       expect(lecture.lecture_memberships.where(user: user)).to exist
+    end
+  end
+  describe "#destruction_blockers" do
+    let(:seminar) { create(:lecture, :is_seminar) }
+    let(:talk) { create(:talk, lecture: seminar) }
+
+    it "is empty for a bare talk" do
+      expect(talk.destruction_blockers).to be_empty
+      expect(talk).to be_destructible
+    end
+
+    it "reports attached media, which destroy would take with it" do
+      create(:medium, :with_description, :with_editors, teachable: talk, sort: "Lecture")
+
+      expect(talk.destruction_blockers).to include(:media)
+      expect { talk.destroy }.not_to change(described_class, :count)
+      expect(talk.errors[:base])
+        .to include(I18n.t("roster.errors.cannot_delete_with_media"))
+    end
+
+    it "reports speakers" do
+      talk.add_user_to_roster!(create(:confirmed_user))
+
+      expect(talk.destruction_blockers).to include(:roster_not_empty)
+    end
+
+    # The campaign states are covered for every registerable in the shared
+    # example; what is talk-specific is that its own blockers still apply once
+    # the campaign no longer holds it.
+    it "still refuses a finalized process's talk that somebody holds" do
+      campaign = create(:registration_campaign, campaignable: seminar,
+                                                allocation_mode: :first_come_first_served)
+      create(:registration_item, registration_campaign: campaign, registerable: talk)
+      campaign.update!(status: :open)
+      campaign.update!(status: :completed)
+      talk.add_user_to_roster!(create(:confirmed_user))
+
+      expect(talk.reload.destruction_blockers).to include(:roster_not_empty)
+      expect { talk.destroy }.not_to change(described_class, :count)
     end
   end
 end

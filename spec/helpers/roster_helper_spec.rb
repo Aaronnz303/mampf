@@ -79,4 +79,56 @@ RSpec.describe(RosterHelper, type: :helper) do
       expect(badge).to include('data-turbo="false"')
     end
   end
+
+  describe "#rosterable_display_type" do
+    let(:lecture) { create(:lecture) }
+    let(:seminar) { create(:seminar) }
+    context "for Tutorial" do
+      let(:tutorial) { create(:tutorial, lecture: lecture) }
+
+      it "returns tutorial type label" do
+        expect(helper.rosterable_display_type(tutorial))
+          .to eq(I18n.t("registration.item.types.tutorial"))
+      end
+    end
+
+    context "for Talk" do
+      let(:talk) { create(:talk, lecture: seminar, position: 5) }
+
+      it "returns talk type label with position" do
+        expect(helper.rosterable_display_type(talk))
+          .to eq("#{I18n.t("registration.item.types.talk")} 5")
+      end
+    end
+
+    context "for Cohort" do
+      context "with propagation" do
+        let(:cohort) { create(:cohort, context: lecture, propagate_to_lecture: true) }
+
+        it "returns group label without icon" do
+          expect(helper.rosterable_display_type(cohort))
+            .to eq(I18n.t("registration.item.types.other_group"))
+        end
+      end
+
+      context "without propagation" do
+        let(:cohort) { create(:cohort, context: lecture, propagate_to_lecture: false) }
+
+        it "returns group label with no-propagation icon" do
+          result = helper.rosterable_display_type(cohort)
+          expect(result).to include(I18n.t("registration.item.types.other_group"))
+          expect(result).to include("bi-person-x")
+          expect(result).to include(I18n.t("registration.item.hints.no_propagation"))
+        end
+      end
+    end
+
+    context "for unknown type" do
+      let(:something) { double("UnknownType") }
+
+      it "returns nil safely" do
+        expect(helper.rosterable_display_type(something)).to be_nil
+      end
+    end
+  end
 end

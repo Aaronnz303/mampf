@@ -5,7 +5,51 @@ module Rosters
   module Rosterable
     extend ActiveSupport::Concern
 
-    TYPES = ["Tutorial", "Talk", "Cohort", "Lecture"].freeze
+    TYPE_CLASS_MAP = {
+      "Tutorial" => -> { Tutorial },
+      "Talk" => -> { Talk },
+      "Cohort" => -> { Cohort },
+      "Lecture" => -> { Lecture }
+    }.freeze
+
+    TYPES = TYPE_CLASS_MAP.keys.freeze
+
+    # Student self-service roster access modes (see #self_materialization_mode).
+    SELF_MATERIALIZATION_MODES = {
+      disabled: 0,
+      add_only: 1,
+      remove_only: 2,
+      add_and_remove: 3
+    }.freeze
+
+    # Self-service subsets of the modes above. SELF_ADD_MODES is also what the
+    # self_addable scope queries, so predicate and SQL cannot drift apart.
+    SELF_ADD_MODES = [:add_only, :add_and_remove].freeze
+    SELF_REMOVE_MODES = [:remove_only, :add_and_remove].freeze
+
+    DESTRUCTION_BLOCKER_KEYS = {
+      in_campaign: "roster.errors.cannot_delete_in_campaign",
+      roster_not_empty: "roster.errors.cannot_delete_not_empty",
+      submissions: "controllers.tutorials.errors.cannot_delete_with_submissions",
+      media: "roster.errors.cannot_delete_with_media"
+    }.freeze
+
+    def self.class_for(type)
+      TYPE_CLASS_MAP[type]&.call
+    end
+
+    class_methods do
+      # Override if the association name doesn't follow the pattern
+      # #{model_name}_memberships (e.g., Talk uses :speaker_talk_joins)
+      def roster_association_name
+        :"#{name.underscore}_memberships"
+      end
+
+      # The join model that holds this rosterable's roster entries.
+      def roster_join_class
+        reflect_on_association(roster_association_name).klass
+      end
+    end
 
     # Models including this concern must:
     # - Implement #roster_entries (returns ActiveRecord::Relation)
@@ -26,18 +70,15 @@ module Rosters
         :user_id
       end
 
-      # Override this method if the association name doesn't follow the pattern
-      # #{model_name}_memberships (e.g., Talk uses :speaker_talk_joins)
-      def roster_association_name
-        :"#{self.class.name.underscore}_memberships"
-      end
+      delegate :roster_association_name, to: :class
 
-      enum :self_materialization_mode, {
-        disabled: 0,
-        add_only: 1,
-        remove_only: 2,
-        add_and_remove: 3
-      }, prefix: true
+      enum :self_materialization_mode, SELF_MATERIALIZATION_MODES, prefix: true
+
+      scope :self_addable, -> { where(self_materialization_mode: SELF_ADD_MODES) }
+
+      # Restricts to the rosterables of the given lectures. Cohort and Lecture
+      # reference their lecture differently and override this.
+      scope :for_lectures, ->(lectures) { where(lecture_id: lectures) }
 
       before_validation :enforce_consistency_between_modes
       validate :validate_skip_campaigns_switch
@@ -45,20 +86,84 @@ module Rosters
       before_destroy :enforce_rosterable_destruction_constraints, prepend: true
     end
 
+    # Models add their own type-specific blockers on top of these.
+    def destruction_blockers
+      blockers = []
+      blockers << :in_campaign if in_active_campaign?
+      blockers << :roster_not_empty unless roster_empty?
+      blockers
+    end
+
+    # What "remove from the campaign and delete the group" has to satisfy.
+    def destruction_blockers_outside_campaign
+      destruction_blockers - [:in_campaign]
+    end
+
+    def destruction_blocker_messages(blockers = destruction_blockers)
+      blockers.map { |blocker| I18n.t(DESTRUCTION_BLOCKER_KEYS.fetch(blocker)) }
+    end
+
     # Checks if the item can be safely destroyed.
     def destructible?
-      !in_campaign? && roster_empty?
+      destruction_blockers.empty?
+    end
+
+    # Whether campaigns, not manual edits, decide this roster. Models without
+    # skip_campaigns (e.g. Lecture) are not campaign-managed.
+    def campaign_managed?
+      respond_to?(:skip_campaigns) && !skip_campaigns?
     end
 
     # Checks if the roster is locked for manual modifications.
-    # Models without skip_campaigns (e.g., Lecture) are never locked.
     # A roster is locked if campaigns are NOT skipped AND no campaign
     # has been completed yet.
     def locked?
-      return false unless respond_to?(:skip_campaigns)
-      return false if skip_campaigns?
+      campaign_managed? && !in_completed_campaign?
+    end
 
-      !in_completed_campaign?
+    # Whether holding a slot in this rosterable precludes holding another
+    # slot of the same kind in the same lecture — i.e. taking a new slot
+    # would require LEAVING the current one (backed by a DB uniqueness on
+    # user + lecture). This is the only situation that creates a
+    # "must leave to join" conflict, so it is what gates both the
+    # uniqueness check on self-add and the "blocked by an unremovable
+    # assignment" hint in the registration UI. Non-exclusive pools (talks,
+    # cohorts) allow several simultaneous memberships and never conflict.
+    def roster_exclusive_within_lecture?
+      false
+    end
+
+    # The rosterable in the same lecture that the user would have to leave
+    # before joining this one, or nil if there is none. Only roster-exclusive
+    # pools (see #roster_exclusive_within_lecture?) can produce a conflict;
+    # non-exclusive pools coexist, so they always return nil.
+    def conflicting_lecture_membership(_user)
+      nil
+    end
+
+    def config_allow_self_add?
+      SELF_ADD_MODES.include?(self_materialization_mode.to_sym)
+    end
+
+    # guard for self-assignment possibility
+    def allow_self_add?(user)
+      return false unless config_allow_self_add?
+      return false if locked?
+      return false if user_allocated?(user)
+
+      !full?
+    end
+
+    def config_allow_self_remove?
+      SELF_REMOVE_MODES.include?(self_materialization_mode.to_sym)
+    end
+
+    # guard for self-removal possibility
+    def allow_self_remove?(user)
+      return false unless config_allow_self_remove?
+      return false if locked?
+
+      user_allocated?(user)
     end
 
     # Checks if skip_campaigns can be enabled (switched from false to true).
@@ -110,6 +215,16 @@ module Rosters
       registration_items.exists?
     end
 
+    # Whether a campaign that has not been finalized holds this group. A
+    # finalized one no longer decides its roster.
+    def in_active_campaign?
+      return false unless respond_to?(:registration_items)
+
+      registration_items.joins(:registration_campaign)
+                        .where.not(registration_campaigns: { status: :completed })
+                        .exists?
+    end
+
     # Checks if the item is associated with a completed campaign.
     def in_completed_campaign?
       return false unless respond_to?(:registration_items)
@@ -128,6 +243,14 @@ module Rosters
         roster_entries.map { |e| e.public_send(roster_user_id_column) }
       else
         roster_entries.pluck(roster_user_id_column)
+      end
+    end
+
+    def user_allocated?(user)
+      if roster_entries.loaded?
+        roster_entries.any? { |e| e.public_send(roster_user_id_column) == user.id }
+      else
+        roster_entries.exists?(roster_user_id_column => user.id)
       end
     end
 
@@ -181,19 +304,14 @@ module Rosters
       users_to_add = target_ids - current_ids
       return if users_to_add.empty?
 
-      # insert_all does not automatically apply the association scope (e.g. foreign keys).
-      # We must explicitly merge the scope attributes (like { tutorial_id: 123 }).
       scope_attrs = roster_entries.scope_attributes
+      now = Time.current
 
       attributes = users_to_add.map do |uid|
-        {
-          roster_user_id_column => uid,
-          :source_campaign_id => campaign.id,
-          :created_at => Time.current,
-          :updated_at => Time.current
-        }.merge(scope_attrs)
+        missing_roster_entry_attributes(uid, campaign, scope_attrs, now)
       end
-      roster_entries.insert_all(attributes) # rubocop:disable Rails/SkipsModelValidations
+
+      persist_missing_roster_entries!(attributes)
     end
 
     # Identifies users currently in the roster associated with this specific
@@ -216,10 +334,16 @@ module Rosters
 
     # Checks if the roster is full (reached or exceeded capacity).
     def full?
+      full_for_count?(roster_entries_count)
+    end
+
+    # Same check against a roster size the caller already knows, so that code
+    # counting many rosterables at once need not pay a query per record.
+    def full_for_count?(count)
       return false unless respond_to?(:capacity)
       return false if capacity.nil?
 
-      roster_entries_count >= capacity
+      count >= capacity
     end
 
     # Returns the group type symbol for this rosterable (e.g. :tutorials, :talks).
@@ -228,6 +352,24 @@ module Rosters
     end
 
     private
+
+      def missing_roster_entry_attributes(user_id, campaign, scope_attrs, now)
+        {
+          roster_user_id_column => user_id,
+          :source_campaign_id => campaign.id,
+          :created_at => now,
+          :updated_at => now
+        }.merge(scope_attrs)
+          .merge(extra_roster_entry_attributes(user_id, campaign))
+      end
+
+      def extra_roster_entry_attributes(_user_id, _campaign)
+        {}
+      end
+
+      def persist_missing_roster_entries!(attributes)
+        roster_entries.insert_all(attributes) # rubocop:disable Rails/SkipsModelValidations
+      end
 
       def validate_skip_campaigns_switch
         return unless respond_to?(:skip_campaigns)
@@ -263,14 +405,12 @@ module Rosters
       end
 
       def enforce_rosterable_destruction_constraints
-        if in_campaign?
-          errors.add(:base, I18n.t("roster.errors.cannot_delete_in_campaign"))
-          throw(:abort)
+        blockers = destruction_blockers
+        return if blockers.empty?
+
+        destruction_blocker_messages(blockers).each do |message|
+          errors.add(:base, message)
         end
-
-        return if roster_empty?
-
-        errors.add(:base, I18n.t("roster.errors.cannot_delete_not_empty"))
         throw(:abort)
       end
 

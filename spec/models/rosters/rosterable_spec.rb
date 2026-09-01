@@ -1,6 +1,33 @@
 require "rails_helper"
 
 RSpec.describe(Rosters::Rosterable) do
+  describe ".class_for" do
+    it "returns the explicitly allowed class for a valid type" do
+      expect(described_class.class_for("Tutorial")).to eq(Tutorial)
+      expect(described_class.class_for("Talk")).to eq(Talk)
+      expect(described_class.class_for("Cohort")).to eq(Cohort)
+      expect(described_class.class_for("Lecture")).to eq(Lecture)
+    end
+
+    it "returns nil for an invalid type" do
+      expect(described_class.class_for("User")).to be_nil
+    end
+  end
+
+  describe "#campaign_managed?" do
+    it "is false for a rosterable that skips campaigns" do
+      expect(create(:tutorial, skip_campaigns: true)).not_to be_campaign_managed
+    end
+
+    it "is true for a rosterable left to the campaigns" do
+      expect(create(:tutorial, skip_campaigns: false)).to be_campaign_managed
+    end
+
+    it "is false for a lecture, which has no skip_campaigns" do
+      expect(create(:lecture)).not_to be_campaign_managed
+    end
+  end
+
   describe "#locked?" do
     let(:rosterable) { create(:tutorial, skip_campaigns: true) }
 
@@ -298,6 +325,38 @@ RSpec.describe(Rosters::Rosterable) do
     end
   end
 
+  describe ".for_lectures" do
+    let(:lecture) { create(:lecture) }
+    let(:other_lecture) { create(:lecture) }
+
+    it "finds tutorials by their lecture" do
+      tutorial = create(:tutorial, lecture: lecture)
+      create(:tutorial, lecture: other_lecture)
+
+      expect(Tutorial.for_lectures([lecture.id])).to contain_exactly(tutorial)
+    end
+
+    it "finds cohorts by their lecture context" do
+      cohort = create(:cohort, context: lecture)
+      create(:cohort, context: other_lecture)
+
+      expect(Cohort.for_lectures([lecture.id])).to contain_exactly(cohort)
+    end
+
+    it "does not mistake a non-lecture cohort context for a lecture" do
+      course = create(:course)
+      create(:cohort, context: course)
+
+      expect(Cohort.for_lectures([course.id])).to be_empty
+    end
+
+    it "finds lectures by their own id" do
+      create(:lecture)
+
+      expect(Lecture.for_lectures([lecture.id])).to contain_exactly(lecture)
+    end
+  end
+
   describe "capacity checks" do
     let(:rosterable) { create(:tutorial) }
 
@@ -340,6 +399,115 @@ RSpec.describe(Rosters::Rosterable) do
       it "returns true when over capacity" do
         create_list(:tutorial_membership, 3, tutorial: rosterable)
         expect(rosterable.full?).to be(true)
+      end
+    end
+
+    describe "#full_for_count?" do
+      it "judges the given count rather than the roster" do
+        create_list(:tutorial_membership, 2, tutorial: rosterable)
+
+        expect(rosterable.full_for_count?(1)).to be(false)
+        expect(rosterable.full_for_count?(2)).to be(true)
+        expect(rosterable.full_for_count?(3)).to be(true)
+      end
+
+      it "returns false if capacity is nil" do
+        allow(rosterable).to receive(:capacity).and_return(nil)
+
+        expect(rosterable.full_for_count?(99)).to be(false)
+      end
+    end
+  end
+
+  describe "allow self materialization checks" do
+    let(:rosterable) { create(:tutorial) }
+    let(:user) { create(:user) }
+    before do
+      allow(rosterable).to receive(:capacity).and_return(2)
+    end
+
+    describe "#allow_self_add?" do
+      context "when self-add is allowed, not locked, not full, and user not allocated" do
+        before do
+          rosterable.update(self_materialization_mode: :add_and_remove)
+        end
+        it "returns true" do
+          expect(rosterable.allow_self_add?(user)).to be(true)
+        end
+      end
+      context "when self-add is not allowed" do
+        before do
+          rosterable.update(self_materialization_mode: :disabled)
+        end
+        it "returns false" do
+          expect(rosterable.allow_self_add?(user)).to be(false)
+        end
+      end
+      context "when locked" do
+        before do
+          allow(rosterable).to receive(:locked?).and_return(true)
+          rosterable.update(self_materialization_mode: :add_and_remove)
+        end
+        it "returns false" do
+          expect(rosterable.allow_self_add?(user)).to be(false)
+        end
+      end
+      context "when full" do
+        before do
+          create_list(:tutorial_membership, 2, tutorial: rosterable)
+          rosterable.update(self_materialization_mode: :add_and_remove)
+        end
+        it "returns false" do
+          expect(rosterable.allow_self_add?(user)).to be(false)
+        end
+      end
+      context "when user already allocated" do
+        before do
+          rosterable.add_user_to_roster!(user)
+          rosterable.update(self_materialization_mode: :add_and_remove)
+        end
+        it "returns false" do
+          expect(rosterable.allow_self_add?(user)).to be(false)
+        end
+      end
+    end
+
+    describe "#allow_self_remove?" do
+      context "when self-remove is allowed, not locked, and user is allocated" do
+        before do
+          rosterable.update(self_materialization_mode: :add_and_remove)
+          rosterable.add_user_to_roster!(user)
+        end
+        it "returns true" do
+          expect(rosterable.allow_self_remove?(user)).to be(true)
+        end
+      end
+      context "when self-remove is not allowed" do
+        before do
+          rosterable.update(self_materialization_mode: :add_only)
+          rosterable.add_user_to_roster!(user)
+        end
+        it "returns false" do
+          expect(rosterable.allow_self_remove?(user)).to be(false)
+        end
+      end
+      context "when locked" do
+        before do
+          allow(rosterable).to receive(:locked?).and_return(true)
+          rosterable.update(self_materialization_mode: :add_and_remove)
+          rosterable.add_user_to_roster!(user)
+        end
+        it "returns false" do
+          expect(rosterable.allow_self_remove?(user)).to be(false)
+        end
+      end
+      context "when user not allocated" do
+        before do
+          rosterable.update(self_materialization_mode: :add_and_remove)
+        end
+        it "returns false" do
+          expect(rosterable.allow_self_remove?(user)).to be(false)
+        end
       end
     end
   end

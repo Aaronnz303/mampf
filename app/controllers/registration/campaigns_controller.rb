@@ -7,6 +7,13 @@ module Registration
     before_action :set_locale
     authorize_resource class: "Registration::Campaign", except: [:index, :new, :create]
 
+    # set_campaign finds without locking, so a campaign deleted in between
+    # surfaces here, when with_lock reloads it.
+    rescue_from ActiveRecord::RecordNotFound do
+      respond_with_flash(:alert, t("registration.campaign.not_found"),
+                         redirect_path: root_path)
+    end
+
     def current_ability
       @current_ability ||= RegistrationCampaignAbility.new(current_user)
     end
@@ -40,15 +47,21 @@ module Registration
         return
       end
 
-      unassigned_users = @campaign.unassigned_users(preload_registrations: true)
+      render_campaign_panel(
+        students: @campaign.unassigned_users(preload_registrations: true),
+        panel_kind: :unassigned
+      )
+    end
 
-      render turbo_stream: turbo_stream.replace(
-        "tutorial-roster-side-panel",
-        html: RosterSidePanelComponent.new(
-          campaign: @campaign,
-          students: unassigned_users,
-          is_unassigned: true
-        ).render_in(view_context)
+    def rejected
+      unless params[:source] == "panel"
+        redirect_to edit_lecture_path(@campaign.campaignable, tab: "groups")
+        return
+      end
+
+      render_campaign_panel(
+        students: @campaign.rejected_users(preload_registrations: true),
+        panel_kind: :rejected
       )
     end
 
@@ -99,21 +112,22 @@ module Registration
     end
 
     def destroy
-      unless @campaign.can_be_deleted?
-        respond_with_flash(:alert, t("registration.campaign.cannot_delete"),
-                           redirect_path: registration_campaign_path(@campaign))
-        return
+      lecture = @campaign.campaignable
+      was_draft = @campaign.draft?
+      destroyed = false
+
+      @campaign.with_lock do
+        destroyed = @campaign.destroy
       end
 
-      lecture = @campaign.campaignable
-
-      if @campaign.destroy
-        respond_with_flash(:notice, t("registration.campaign.destroyed"),
+      if destroyed
+        message = was_draft ? "destroyed" : "discarded"
+        respond_with_flash(:notice, t("registration.campaign.#{message}"),
                            redirect_path: lecture_registration_campaigns_path(lecture)) do
           evaluate_turbo_update_streams(lecture: lecture)
         end
       else
-        respond_with_flash(:alert, @campaign.errors.full_messages.join(", "),
+        respond_with_flash(:alert, campaign_destruction_error,
                            redirect_path: registration_campaign_path(@campaign))
       end
     end
@@ -169,7 +183,56 @@ module Registration
                          redirect_path: registration_campaign_path(@campaign))
     end
 
+    # Unfreezes an opened campaign so its configuration and groups can be
+    # changed again. The model decides whether that is still harmless.
+    def revert_to_draft
+      reverted = false
+
+      @campaign.with_lock do
+        reverted = @campaign.update(status: :draft)
+      end
+
+      if reverted
+        respond_with_flash(:notice, t("registration.campaign.reverted_to_draft"),
+                           redirect_path: registration_campaign_path(@campaign)) do
+          evaluate_turbo_update_streams(lecture: @campaign.campaignable,
+                                        expanded_campaign_id: @campaign.id)
+        end
+      else
+        respond_with_flash(:alert, @campaign.errors.full_messages.join(", "),
+                           redirect_path: registration_campaign_path(@campaign))
+      end
+    end
+
+    # Opens (or closes) student self-service on all of the campaign's groups
+    # once it is completed, so students are not silently locked into their
+    # allocated group.
+    def self_service
+      unless @campaign.completed?
+        return respond_with_flash(
+          :alert, t("registration.campaign.self_service.only_when_completed"),
+          redirect_path: registration_campaign_path(@campaign)
+        )
+      end
+
+      @campaign.apply_self_materialization_mode!(params[:self_materialization_mode])
+
+      respond_with_flash(:notice, t("registration.campaign.self_service.updated"),
+                         redirect_path: registration_campaign_path(@campaign)) do
+        evaluate_turbo_update_streams(lecture: @campaign.campaignable,
+                                      expanded_campaign_id: @campaign.id)
+      end
+    rescue ArgumentError, ActiveRecord::RecordInvalid
+      respond_with_flash(:alert, t("registration.campaign.self_service.failed"),
+                         redirect_path: registration_campaign_path(@campaign))
+    end
+
     private
+
+      def campaign_destruction_error
+        @campaign.errors.full_messages.presence&.join(", ") ||
+          t("registration.campaign.cannot_delete")
+      end
 
       def set_lecture
         @lecture = Lecture.find_by(id: params[:lecture_id])
@@ -197,6 +260,17 @@ module Registration
         params.expect(
           registration_campaign: [:description, :allocation_mode,
                                   :registration_deadline]
+        )
+      end
+
+      def render_campaign_panel(students:, panel_kind: nil)
+        render turbo_stream: turbo_stream.replace(
+          "tutorial-roster-side-panel",
+          html: RosterSidePanelComponent.new(
+            campaign: @campaign,
+            students: students,
+            panel_kind: panel_kind
+          ).render_in(view_context)
         )
       end
 

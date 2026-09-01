@@ -7,11 +7,6 @@
     padding: 1rem 1.15rem;
     background: linear-gradient(160deg, mampf-blue(0.14), mampf-blue(0.05));
 
-    &:hover .registration-campaign-header-actions,
-    &:focus-within .registration-campaign-header-actions {
-      opacity: 1;
-    }
-
     .policy-badge {
       vertical-align: middle;
       cursor: default;
@@ -60,12 +55,12 @@
     }
   }
 
+  // Always visible: the way out of a registration process is what one looks
+  // for when stuck, so it must not depend on finding it by hovering.
   .registration-campaign-header-actions {
     position: absolute;
     top: 0.65rem;
     right: 0.65rem;
-    opacity: 0;
-    transition: opacity 0.15s ease-in-out;
   }
 
   .card-body {
@@ -80,15 +75,15 @@
   .registration-campaign-start-btn {
     border: 1px solid $mampf-blue;
     border-radius: 0.55rem;
-    background: linear-gradient(160deg, mampf-blue(0.95), mampf-blue(0.85));
-    color: #fff;
+    background: linear-gradient(160deg, mampf-blue(0.12), mampf-blue(0.06));
+    color: $mampf-blue;
     font-weight: 600;
 
     &:hover,
     &:focus {
       border-color: $mampf-blue-focus;
-      background: linear-gradient(160deg, $mampf-blue-focus, $mampf-blue);
-      color: #fff;
+      background: linear-gradient(160deg, mampf-blue(0.16), mampf-blue(0.09));
+      color: $mampf-blue-focus;
     }
   }
 
@@ -102,13 +97,6 @@
     .btn {
       width: 100%;
     }
-  }
-}
-
-@media (hover: none) {
-  .registration-campaign-card .registration-campaign-card-header
-  .registration-campaign-header-actions {
-    opacity: 1;
   }
 }
 
@@ -236,6 +224,38 @@
   background: linear-gradient(135deg, #f0f4fd 0%, #f5f9fd 100%);
 }
 
+.registration-section-choice-text {
+  min-width: 0;
+}
+
+.registration-section-choice-actions {
+  flex-shrink: 0;
+}
+
+@media (min-width: 992px) {
+  .registration-section-choice-body {
+    justify-content: space-between;
+  }
+
+  .registration-section-choice-text {
+    max-width: 68%;
+  }
+}
+
+.registration-campaign-section-toggle-icon {
+  transition: transform 0.2s ease;
+}
+
+.registration-campaign-section-toggle {
+  line-height: 1;
+}
+
+.registration-campaign-section-toggle[aria-expanded="true"] {
+  .registration-campaign-section-toggle-icon {
+    transform: rotate(180deg);
+  }
+}
+
 .registration-campaign-ghost-label,
 .registration-campaign-ghost-title {
   font-size: 0.72rem;
@@ -264,7 +284,7 @@
   opacity: 0.45;
 }
 
-.unassigned-warning-trigger {
+.campaign-panel-trigger {
   cursor: pointer;
 
   &:focus:not(:focus-visible) {

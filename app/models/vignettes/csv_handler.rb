@@ -1,5 +1,3 @@
-require "csv"
-
 module Vignettes
   class CsvHandler
     HEADERS = ["Answer ID",
@@ -20,7 +18,7 @@ module Vignettes
       data = [
         answer.id,
         answer.created_at.strftime("%Y-%m-%d %H:%M"),
-        Codename.user_codename(answer.user_answer.user, answer.user_answer.questionnaire.lecture),
+        answer.user_answer.codename.pseudonym,
         answer.slide.position,
         answer.slide.title,
         answer.slide_statistic.total_time_on_slide,
@@ -48,7 +46,7 @@ module Vignettes
 
     def self.generate_questionnaire_csv(questionnaire)
       answer_data = questionnaire.answers_data
-      CSV.generate(col_sep: ";", encoding: "UTF-8") do |csv|
+      SafeCsv.generate(col_sep: ";", encoding: "UTF-8") do |csv|
         csv << HEADERS
         answer_data.each do |answer|
           csv << answer_data(answer)

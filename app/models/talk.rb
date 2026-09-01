@@ -70,6 +70,10 @@ class Talk < ApplicationRecord
     user.in?(speakers)
   end
 
+  def cache_key
+    "#{super}-#{I18n.locale}"
+  end
+
   def title_for_viewers
     Rails.cache.fetch("#{cache_key_with_version}/title_for_viewers") do
       "#{lecture.title_for_viewers}, #{to_label}"
@@ -123,6 +127,14 @@ class Talk < ApplicationRecord
     speakers << speaker unless speaker.in?(speakers)
   end
 
+  # Deleting a talk takes its media with it, and there is no way to get them
+  # back, so they have to be moved or deleted deliberately first.
+  def destruction_blockers
+    blockers = super
+    blockers << :media if media.exists?
+    blockers
+  end
+
   def roster_entries
     speaker_talk_joins
   end
@@ -131,8 +143,12 @@ class Talk < ApplicationRecord
     :speaker_id
   end
 
-  def roster_association_name
+  def self.roster_association_name
     :speaker_talk_joins
+  end
+
+  def exclusive_assignment?
+    true
   end
 
   private

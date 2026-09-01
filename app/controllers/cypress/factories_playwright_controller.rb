@@ -7,7 +7,14 @@ module Cypress
     # Creates an instance of the factory (via FactoryBot) and returns it as JSON.
     def create
       attributes, should_validate = to_attribute_list(params)
-      data = create_class_instance_via_factorybot(attributes, should_validate)
+      data = retrying_deadlocks do
+        # One transaction per attempt: a factory persists a record's
+        # associations before the record itself, and the aborted attempt would
+        # otherwise leave them behind for the next one to duplicate.
+        ActiveRecord::Base.transaction do
+          create_class_instance_via_factorybot(attributes, should_validate)
+        end
+      end
       render json: data.as_json, status: :created
     end
 
@@ -15,8 +22,8 @@ module Cypress
     # Expects as arguments the factory name, the id of the instance,
     # the method name and the method arguments to be passed to the instance method.
     def call_instance_method
-      factory_name = validate_factory_name(params["factory_name"]).capitalize
-      id = params["instance_id"].to_i
+      factory_name = validate_factory_name(params["factory_name"])
+      id = params["instance_id"]
       method_name = params["method_name"]
       method_args = []
 
@@ -37,7 +44,7 @@ module Cypress
 
       # Find the instance
       begin
-        instance = factory_name.constantize.find(id)
+        instance = factory_class_for(factory_name).find(id)
       rescue ActiveRecord::RecordNotFound
         result = { error: "Instance where you'd like to call '#{method_name}' on was not found" }
         return render json: result.to_json, status: :bad_request
@@ -61,6 +68,10 @@ module Cypress
         msg = "factory_name must be a string indicating the factory name."
         msg += " But we got: '#{factory_name}'"
         raise(ArgumentError, msg)
+      end
+
+      def factory_class_for(factory_name)
+        FactoryBot.factories.find(factory_name.to_sym).build_class
       end
 
       def to_attribute_list(params)
